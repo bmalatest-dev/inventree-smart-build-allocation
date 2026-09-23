@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inventree-smart-build-allocation"
+version = "0.1.0"
+description = "Per Vices smart stock allocation rules for InvenTree build orders"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Per Vices Corporation"}]
+license = {text = "MIT"}
+dependencies = []
+
+[project.entry-points."inventree_plugins"]
+SmartBuildAllocationPlugin = "inventree_smart_build_allocation.plugin:SmartBuildAllocationPlugin"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["inventree_smart_build_allocation*"]
+
+[tool.setuptools.package-data]
+inventree_smart_build_allocation = ["static/*.js"]

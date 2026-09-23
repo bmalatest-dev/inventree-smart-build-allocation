@@ -1,0 +1,1 @@
+recursive-include inventree_smart_build_allocation/static *.js
