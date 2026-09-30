@@ -1,4 +1,4 @@
-"""Allocation rules for Per Vices Smart Build Allocation v0.2.0."""
+"""Allocation rules for Per Vices Smart Build Allocation v0.2.1."""
 PASSIVE_FOOTPRINT_SPILLAGE = {"0201":200,"0402":100,"0603":50,"0805":25,"1206":20,"1210":20}
 LOW_COST_REEL_THRESHOLD = 0.15
 
@@ -96,14 +96,14 @@ def part_parameter(part,name):
 
 def is_hand_placement(part): return _txt(part_parameter(part,"Hand Placement")).lower() in {"yes","true","1","y"}
 
-def rank_stock_items(stock_items,required_part=None,required_qty=0,group_build_ids=None):
+def rank_stock_items(stock_items,required_part=None,required_qty=0,group_build_ids=None,projected_quantities=None):
     """Rank candidates using the v0.2 workflow.
 
     Group stock already committed to one of the selected sequential BOs is preferred.
     Out-for-assembly stock outside the selected group is excluded from automatic allocation;
     it belongs in the future LOCATION WARNING / review path instead.
     """
-    req=max(_num(required_qty,0),0.0); group=set(int(x) for x in (group_build_ids or []))
+    req=max(_num(required_qty,0),0.0); group=set(int(x) for x in (group_build_ids or [])); projected_quantities=projected_quantities or {}
     hand=is_hand_placement(required_part)
     candidates=[]
     for stock in list(stock_items):
@@ -112,7 +112,7 @@ def rank_stock_items(stock_items,required_part=None,required_qty=0,group_build_i
             continue
         candidates.append(stock)
     def key(stock):
-        q=available_quantity(stock); enough=q>=req if req>0 else True
+        q=projected_quantities.get(getattr(stock,"pk",None),available_quantity(stock)); enough=q>=req if req>0 else True
         group_use=stock_used_by_group(stock,group)
         price=purchase_price(stock); cheap_reel=price is not None and price<LOW_COST_REEL_THRESHOLD and is_reel(stock)
         if hand:
