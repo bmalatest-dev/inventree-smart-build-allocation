@@ -10,7 +10,7 @@ from .rules import rank_stock_items, planned_spillage, is_hand_placement, locati
 GROUP_TTL = 60 * 60 * 24 * 7
 
 def _group_key(build_id):
-    return f"smartbuildallocation:shared-group:v026:{int(build_id)}"
+    return f"smartbuildallocation:shared-group:v027:{int(build_id)}"
 
 def _build_label(build):
     ref = getattr(build, "reference", None) or f"BO-{build.pk}"
@@ -56,6 +56,18 @@ def _part_label(build):
 
 def _build_qty(build):
     return _num(getattr(build, "quantity", 0), 0)
+
+def _build_url(build):
+    return f"/web/manufacturing/build-order/{build.pk}/"
+
+def _part_url(part):
+    return f"/web/part/{part.pk}/"
+
+def _build_part(build):
+    part = getattr(build, "part", None)
+    if part is None:
+        return {"pk": None, "label": "", "url": ""}
+    return {"pk": part.pk, "label": str(part), "url": _part_url(part)}
 
 class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, InvenTreePlugin):
     NAME = "SmartBuildAllocation"
@@ -143,7 +155,9 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             item = {
                 "pk": b.pk,
                 "label": _build_label(b),
+                "url": _build_url(b),
                 "part": _part_label(b),
+                "part_detail": _build_part(b),
                 "quantity": _build_qty(b),
                 "status": _status_text(b),
                 "parent_id": _parent_id(b),
@@ -215,6 +229,39 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
         qs = StockItem.objects.filter(part=part).select_related("location", "part")
         return list(qs)
 
+    def _stock_option(self, stock, group_ids, recommended=False):
+        from .rules import is_unreceived, is_out_for_assembly, stock_used_by_group
+        loc = location_name(stock)
+        low = (loc or "").lower()
+        warnings = []
+        selectable = True
+        if is_unreceived(stock):
+            warnings.append("Ordered / awaiting receipt")
+            selectable = False
+        if is_out_for_assembly(stock) and not stock_used_by_group(stock, group_ids):
+            warnings.append("Out-for-Assembly outside this group")
+        if not loc:
+            warnings.append("Unknown location")
+        elif "component room" not in low and not low.startswith("out-for-assembly"):
+            warnings.append("Non-preferred location")
+        return {
+            "stock_id": stock.pk,
+            "quantity": available_quantity(stock),
+            "location": loc or "Unknown",
+            "recommended": recommended,
+            "selectable": selectable,
+            "warnings": warnings,
+        }
+
+    def _stock_options(self, stock_items, group_ids, recommended_ids=None):
+        recommended_ids = set(recommended_ids or [])
+        return sorted(
+            [self._stock_option(s, group_ids, s.pk in recommended_ids)
+             for s in stock_items if available_quantity(s) > 0],
+            key=lambda x: (not x["recommended"], not x["selectable"], len(x["warnings"]),
+                           x["quantity"], x["stock_id"]),
+        )
+
     def _manual_stock_options(self, stock_items, group_ids):
         """Stock which exists but must never be selected automatically."""
         from .rules import is_unreceived, is_out_for_assembly, stock_used_by_group
@@ -235,9 +282,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             })
         return options
 
-    def _preview(self, build_id):
+    def _preview(self, build_id, overrides=None):
         from build.models import Build
 
+        overrides = overrides or {}
         group_ids = self._get_group(build_id)
         builds = list(Build.objects.filter(pk__in=group_ids))
         by_id = {b.pk: b for b in builds}
@@ -245,7 +293,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
         projected = {}  # stock pk -> projected quantity remaining after prior BOs + spillage
         result = {
-            "group": [{"pk": b.pk, "label": _build_label(b), "sequence": i + 1} for i, b in enumerate(ordered_builds)],
+            "group": [{
+                "pk": b.pk, "label": _build_label(b), "url": _build_url(b),
+                "part": _build_part(b), "sequence": i + 1
+            } for i, b in enumerate(ordered_builds)],
             "easy": [],
             "spillage": [],
             "location": [],
@@ -273,12 +324,24 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     projected_quantities=projected,
                 )
 
+                override_key = f"{build.pk}:{part.pk}"
+                override_rows = overrides.get(override_key, [])
+                override_by_id = {
+                    int(x.get("stock_id")): _num(x.get("quantity"), 0)
+                    for x in override_rows
+                    if x.get("stock_id") is not None and _num(x.get("quantity"), 0) > 0
+                }
+                if override_by_id:
+                    by_stock_id = {s.pk: s for s in stock_items}
+                    ranked = [by_stock_id[sid] for sid in override_by_id if sid in by_stock_id]
+
                 # First prefer a single package that satisfies BOM + spillage.
                 chosen = None
                 warning = None
                 for stock in ranked:
                     q = projected.get(stock.pk, available_quantity(stock))
-                    if q >= outstanding + spill:
+                    target = override_by_id.get(stock.pk, outstanding) if override_by_id else outstanding
+                    if q >= target + spill and target >= outstanding:
                         chosen = stock
                         break
 
@@ -286,7 +349,8 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                 if chosen is None:
                     for stock in ranked:
                         q = projected.get(stock.pk, available_quantity(stock))
-                        if q >= outstanding:
+                        target = override_by_id.get(stock.pk, outstanding) if override_by_id else outstanding
+                        if q >= target and target >= outstanding:
                             chosen = stock
                             warning = "spillage"
                             break
@@ -298,15 +362,20 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     projected[chosen.pk] = after
                     loc = location_name(chosen)
                     row = {
-                        "build": _build_label(build), "build_id": build.pk, "sequence": seq,
-                        "part": str(part), "part_id": part.pk,
+                        "build": _build_label(build), "build_id": build.pk, "build_url": _build_url(build),
+                        "build_part": _build_part(build), "sequence": seq,
+                        "part": str(part), "part_id": part.pk, "part_url": _part_url(part),
                         "stock_id": chosen.pk, "location": loc,
+                        "override_key": override_key, "manual_override": bool(override_by_id),
                         "bom_qty": outstanding, "spillage": spill,
                         "spillage_source": spill_source,
                         "projected_before": before, "projected_after": after,
                         "allocate_qty": outstanding,
                         "hand_placement": is_hand_placement(part),
                     }
+                    row["stock_options"] = self._stock_options(
+                        stock_items, group_ids, recommended_ids=[chosen.pk]
+                    )
                     lowloc = (loc or "").lower()
                     if warning == "spillage":
                         row["message"] = "BOM quantity can be satisfied, but full spillage cannot be reserved."
@@ -345,8 +414,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     for stock, take, before in picks:
                         projected[stock.pk] = max(before - take, 0)
                     row = {
-                        "build": _build_label(build), "build_id": build.pk, "sequence": seq,
-                        "part": str(part), "part_id": part.pk,
+                        "build": _build_label(build), "build_id": build.pk, "build_url": _build_url(build),
+                        "build_part": _build_part(build), "sequence": seq,
+                        "part": str(part), "part_id": part.pk, "part_url": _part_url(part),
+                        "override_key": override_key,
                         "bom_qty": outstanding, "spillage": spill,
                         "allocate_qty": outstanding,
                         "hand_placement": is_hand_placement(part),
@@ -365,8 +436,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     manual_options = self._manual_stock_options(stock_items, group_ids)
                     if manual_options:
                         result["manual"].append({
-                            "build": _build_label(build), "build_id": build.pk,
-                            "part": str(part), "part_id": part.pk,
+                            "build": _build_label(build), "build_id": build.pk, "build_url": _build_url(build),
+                            "build_part": _build_part(build),
+                            "part": str(part), "part_id": part.pk, "part_url": _part_url(part),
+                            "override_key": override_key,
                             "required": outstanding,
                             "available_automatic": outstanding - remaining,
                             "options": manual_options,
@@ -374,8 +447,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                         })
                     else:
                         result["insufficient"].append({
-                            "build": _build_label(build), "build_id": build.pk,
-                            "part": str(part), "part_id": part.pk,
+                            "build": _build_label(build), "build_id": build.pk, "build_url": _build_url(build),
+                            "build_part": _build_part(build),
+                            "part": str(part), "part_id": part.pk, "part_url": _part_url(part),
+                            "override_key": override_key,
                             "required": outstanding,
                             "available": outstanding - remaining,
                             "message": "Actual BOM quantity cannot be satisfied.",
@@ -384,10 +459,17 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
         return result
 
     def preview_view(self, request, build_id):
-        if request.method != "GET":
-            return JsonResponse({"error": "Preview is read-only in v0.2.6"}, status=405)
+        if request.method not in ("GET", "POST"):
+            return JsonResponse({"error": "Preview is read-only in v0.2.7"}, status=405)
+        overrides = {}
+        if request.method == "POST":
+            try:
+                payload = json.loads(request.body.decode("utf-8") or "{}")
+                overrides = payload.get("overrides") or {}
+            except Exception:
+                return JsonResponse({"error": "Invalid JSON"}, status=400)
         try:
-            return JsonResponse(self._preview(build_id))
+            return JsonResponse(self._preview(build_id, overrides=overrides))
         except Exception as exc:
             return JsonResponse({"error": f"Preview failed: {type(exc).__name__}: {exc}"}, status=500)
 
@@ -407,7 +489,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v026.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v027.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
