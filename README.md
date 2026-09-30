@@ -1,39 +1,30 @@
-# Smart Build Allocation — v0.1.0
+# Smart Build Allocation — v0.2.0
 
-Per Vices test plugin for InvenTree Build Order stock allocation.
+Test build implementing the first usable version of the updated Feature #19088 workflow.
 
-## First test build
-V0.1.0 uses InvenTree's supported `AllocateMixin`. When **Auto Allocate** is triggered, InvenTree builds its normal valid candidate list and this plugin reorders it:
+## Terminology: Shared Allocation Group
+A **Shared Allocation Group** is the user-selected set of Build Orders which are being assembled at the **same physical location sequentially, not concurrently**. A physical package may intentionally be shared across BOs in this group.
 
-1. Existing manual allocations remain untouched.
-2. Prefer locations containing `component room` (case-insensitive).
-3. Put `out-for-assembly*` locations last.
-4. Prefer exact parts over variant/substitute candidates.
-5. For purchase price below $0.15/pc, prefer reel/spool packaging.
-6. Prefer the smallest stock item that can satisfy the outstanding requirement.
-7. Allow InvenTree to split across stock items when needed.
+Do not group BOs which are being assembled at different locations or concurrently.
 
-The agreed ASR spillage policy is included in `rules.py`, but v0.1.0 does **not** silently allocate extra quantity beyond the BO requirement. The Preview / Review / Commit stage will add spillage after candidate ordering is verified.
+## Implemented in v0.2.0
+- Build Order panel for selecting and saving a Shared Allocation Group before allocation.
+- Group choice is temporary server cache (7 days) and requires no database migration.
+- Existing InvenTree Auto Allocate remains the commit mechanism.
+- Prefer a StockItem already used by another BO in the selected group when InvenTree still considers it a valid candidate.
+- Component Room preference for standard parts.
+- Hand Placement parameter support (`Hand Placement = Yes`).
+- Hand-placement stock may consider Component Room, Rework Room, Storage Room, then other locations; smaller suitable packages are preferred.
+- Standard packaging ranking: Reel, Tray, Tube, Cut Tape, Other.
+- Low-cost Send-a-Reel preference retained.
+- Out-for-Assembly stock outside the selected group is excluded from automatic allocation.
+- Existing spillage policy remains available in rules.py.
 
-## GitHub / installation
-Expected repo: `bmalatest-dev/inventree-smart-build-allocation`
+## Deliberately not complete yet
+The final Preview / Review / Sign-off / Commit workflow is not implemented in v0.2.0. As a result, SPILLAGE WARNING, LOCATION WARNING and MULTI-STOCKITEM WARNING are not yet interactive. V0.2.0 is for local workflow and ranking tests only.
 
-Upload the ZIP contents to the repo root, then install using:
-
-`git+https://github.com/bmalatest-dev/inventree-smart-build-allocation`
-
-Do not append `.git` or a trailing space.
-
-Enable the plugin. If you want the informational Smart Allocation panel, also ensure InvenTree's plugin interface support is enabled. Restart/reload the container if required.
-
-## Recommended first test
-For one BO line requiring 60 pcs:
-
-- Component Room: 500 pcs
-- Component Room: 75 pcs
-- Storage Room: 65 pcs
-- out-for-assembly - test: 60 pcs
-
-Expected first choice: **Component Room / 75 pcs**.
-
-For a part under $0.15/pc with Component Room cut tape 75 pcs and reel 500 pcs, expected first choice is **reel**.
+## Recommended test sequence
+1. Open the primary BO and the Smart Allocation panel.
+2. Select zero or more sequential same-location BOs and save the Shared Allocation Group.
+3. Run normal InvenTree Auto Allocate.
+4. Verify package reuse across the group, Component Room priority, Hand Placement behaviour, packaging preference, and Out-for-Assembly exclusion.
