@@ -10,7 +10,7 @@ from .rules import rank_stock_items, planned_spillage, is_hand_placement, locati
 GROUP_TTL = 60 * 60 * 24 * 7
 
 def _group_key(build_id):
-    return f"smartbuildallocation:shared-group:v025:{int(build_id)}"
+    return f"smartbuildallocation:shared-group:v026:{int(build_id)}"
 
 def _build_label(build):
     ref = getattr(build, "reference", None) or f"BO-{build.pk}"
@@ -22,6 +22,40 @@ def _num(value, default=0.0):
         return float(getattr(value, "amount", value))
     except (TypeError, ValueError):
         return default
+
+def _status_text(obj):
+    status = getattr(obj, "status", None)
+    for candidate in (
+        getattr(obj, "status_text", None),
+        getattr(status, "label", None),
+        getattr(status, "name", None),
+        status,
+    ):
+        if candidate not in (None, ""):
+            return str(candidate).strip().lower()
+    return ""
+
+def _closed_build(build):
+    text = _status_text(build)
+    return any(word in text for word in ("complete", "completed", "cancel", "cancelled", "canceled"))
+
+def _parent_id(build):
+    for attr in ("parent", "parent_build"):
+        value = getattr(build, attr, None)
+        if value is not None:
+            return getattr(value, "pk", value)
+    for attr in ("parent_id", "parent_build_id"):
+        value = getattr(build, attr, None)
+        if value:
+            return value
+    return None
+
+def _part_label(build):
+    part = getattr(build, "part", None)
+    return str(part) if part is not None else ""
+
+def _build_qty(build):
+    return _num(getattr(build, "quantity", 0), 0)
 
 class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, InvenTreePlugin):
     NAME = "SmartBuildAllocation"
@@ -96,20 +130,43 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             return JsonResponse({"ok": True, "build_ids": ordered})
 
         group = self._get_group(build_id)
+        current_parent = _parent_id(current)
         builds = []
-        for b in Build.objects.all().order_by("-pk")[:250]:
-            builds.append({
+        related = []
+        other = []
+
+        # Do not offer completed / cancelled BOs as candidates. Keep current BO visible.
+        for b in Build.objects.select_related("part").all().order_by("-pk")[:500]:
+            if b.pk != build_id and _closed_build(b):
+                continue
+
+            item = {
                 "pk": b.pk,
                 "label": _build_label(b),
+                "part": _part_label(b),
+                "quantity": _build_qty(b),
+                "status": _status_text(b),
+                "parent_id": _parent_id(b),
                 "selected": b.pk in group,
                 "current": b.pk == build_id,
                 "sequence": group.index(b.pk) + 1 if b.pk in group else None,
-            })
+            }
+            builds.append(item)
+
+            if b.pk == build_id or b.pk in group:
+                continue
+            if current_parent is not None and _parent_id(b) == current_parent:
+                related.append(item)
+            else:
+                other.append(item)
 
         return JsonResponse({
             "build_id": build_id,
             "build_ids": group,
             "builds": builds,
+            "related_builds": related,
+            "other_builds": other,
+            "parent_id": current_parent,
             "term": "Shared Allocation Group",
         })
 
@@ -156,8 +213,27 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
     def _stock_for_part(self, part):
         from stock.models import StockItem
         qs = StockItem.objects.filter(part=part).select_related("location", "part")
-        # Keep preview broad; rules.py will rank / flag candidates.
         return list(qs)
+
+    def _manual_stock_options(self, stock_items, group_ids):
+        """Stock which exists but must never be selected automatically."""
+        from .rules import is_unreceived, is_out_for_assembly, stock_used_by_group
+        options = []
+        for stock in stock_items:
+            loc = location_name(stock)
+            if is_unreceived(stock):
+                reason = "Stock is ordered / awaiting receipt and requires a user decision."
+            elif is_out_for_assembly(stock) and not stock_used_by_group(stock, group_ids):
+                reason = "Stock is Out-for-Assembly for a BO outside this Shared Allocation Group."
+            else:
+                continue
+            options.append({
+                "stock_id": stock.pk,
+                "quantity": available_quantity(stock),
+                "location": loc or "Unknown",
+                "reason": reason,
+            })
+        return options
 
     def _preview(self, build_id):
         from build.models import Build
@@ -174,6 +250,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "spillage": [],
             "location": [],
             "multi": [],
+            "manual": [],
             "insufficient": [],
             "notes": [],
         }
@@ -234,11 +311,17 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     if warning == "spillage":
                         row["message"] = "BOM quantity can be satisfied, but full spillage cannot be reserved."
                         result["spillage"].append(row)
+                    elif not lowloc:
+                        row["message"] = "Stock location is unknown; user review is required."
+                        result["location"].append(row)
                     elif is_hand_placement(part) and ("component room" not in lowloc):
                         row["message"] = f"Hand Placement stock selected from non-standard location: {loc or 'Unknown'}."
                         result["location"].append(row)
                     elif lowloc.startswith("out-for-assembly"):
                         row["message"] = f"Stock is currently Out-for-Assembly at {loc}."
+                        result["location"].append(row)
+                    elif (not is_hand_placement(part)) and ("component room" not in lowloc):
+                        row["message"] = f"Stock is outside the preferred Component Room location: {loc}."
                         result["location"].append(row)
                     else:
                         result["easy"].append(row)
@@ -279,19 +362,30 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                         row["message"] = "Standard component requires multiple StockItems; review required."
                         result["multi"].append(row)
                 else:
-                    result["insufficient"].append({
-                        "build": _build_label(build), "build_id": build.pk,
-                        "part": str(part), "part_id": part.pk,
-                        "required": outstanding,
-                        "available": outstanding - remaining,
-                        "message": "Actual BOM quantity cannot be satisfied.",
-                    })
+                    manual_options = self._manual_stock_options(stock_items, group_ids)
+                    if manual_options:
+                        result["manual"].append({
+                            "build": _build_label(build), "build_id": build.pk,
+                            "part": str(part), "part_id": part.pk,
+                            "required": outstanding,
+                            "available_automatic": outstanding - remaining,
+                            "options": manual_options,
+                            "message": "Automatic allocation cannot satisfy the requirement, but stock exists which requires a user decision.",
+                        })
+                    else:
+                        result["insufficient"].append({
+                            "build": _build_label(build), "build_id": build.pk,
+                            "part": str(part), "part_id": part.pk,
+                            "required": outstanding,
+                            "available": outstanding - remaining,
+                            "message": "Actual BOM quantity cannot be satisfied.",
+                        })
 
         return result
 
     def preview_view(self, request, build_id):
         if request.method != "GET":
-            return JsonResponse({"error": "Preview is read-only in v0.2.1"}, status=405)
+            return JsonResponse({"error": "Preview is read-only in v0.2.6"}, status=405)
         try:
             return JsonResponse(self._preview(build_id))
         except Exception as exc:
@@ -313,7 +407,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v025.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v026.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
