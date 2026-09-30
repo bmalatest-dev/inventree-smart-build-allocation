@@ -3,14 +3,14 @@ from django.core.cache import cache
 from django.http import JsonResponse
 from django.urls import path
 from plugin import InvenTreePlugin
-from plugin.mixins import AllocateMixin, SettingsMixin, UserInterfaceMixin, UrlsMixin
+from plugin.mixins import  SettingsMixin, UserInterfaceMixin, UrlsMixin
 from . import PLUGIN_VERSION
 from .rules import rank_stock_items, planned_spillage, is_hand_placement, location_name, available_quantity
 
 GROUP_TTL = 60 * 60 * 24 * 7
 
 def _group_key(build_id):
-    return f"smartbuildallocation:shared-group:v023:{int(build_id)}"
+    return f"smartbuildallocation:shared-group:v024:{int(build_id)}"
 
 def _build_label(build):
     ref = getattr(build, "reference", None) or f"BO-{build.pk}"
@@ -23,7 +23,7 @@ def _num(value, default=0.0):
     except (TypeError, ValueError):
         return default
 
-class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, AllocateMixin, InvenTreePlugin):
+class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, InvenTreePlugin):
     NAME = "SmartBuildAllocation"
     SLUG = "smartbuildallocation"
     TITLE = "Smart Build Allocation"
@@ -297,21 +297,6 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, A
         except Exception as exc:
             return JsonResponse({"error": f"Preview failed: {type(exc).__name__}: {exc}"}, status=500)
 
-    def filter_build_allocation(self, build_line, stock_items, **kwargs):
-        if not stock_items:
-            return stock_items
-        required = max(
-            _num(getattr(build_line, "quantity", 0), 0) -
-            _num(getattr(build_line, "allocated", 0), 0),
-            0,
-        )
-        build = getattr(build_line, "build", None)
-        build_id = getattr(build, "pk", None)
-        group = self._get_group(build_id) if build_id else []
-        return rank_stock_items(
-            stock_items, getattr(build_line, "part", None), required,
-            group_build_ids=group,
-        )
 
     def get_ui_panels(self, request, context, **kwargs):
         context = context or {}
@@ -328,7 +313,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, A
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v023.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v024.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
