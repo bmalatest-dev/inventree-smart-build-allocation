@@ -1,0 +1,94 @@
+export function renderPanel(props) {
+  const React = globalThis.React;
+  const e = React?.createElement;
+  if (!e) return null;
+  const cfg = props?.context || props || {};
+  const buildId = Number(cfg.build_id);
+  const groupUrl = cfg.group_url;
+  const previewUrl = cfg.preview_url;
+  const [data,setData] = React.useState(null);
+  const [order,setOrder] = React.useState([]);
+  const [preview,setPreview] = React.useState(null);
+  const [msg,setMsg] = React.useState("");
+  const [busy,setBusy] = React.useState(false);
+
+  const csrf=()=>document.cookie.match(/csrftoken=([^;]+)/)?.[1]||"";
+  const load=()=>{
+    setBusy(true);
+    fetch(groupUrl,{credentials:"same-origin"}).then(async r=>{
+      const d=await r.json(); if(!r.ok) throw new Error(d.error||"Load failed"); return d;
+    }).then(d=>{setData(d);setOrder(d.build_ids||[buildId]);setMsg("");})
+      .catch(err=>setMsg(String(err))).finally(()=>setBusy(false));
+  };
+  React.useEffect(load,[groupUrl]);
+
+  const add=(id)=>setOrder(s=>s.includes(id)?s:[...s,id]);
+  const remove=(id)=>{if(id!==buildId)setOrder(s=>s.filter(x=>x!==id));};
+  const move=(id,delta)=>setOrder(s=>{
+    const a=[...s], i=a.indexOf(id), j=i+delta;
+    if(i<=0 || j<=0 || j>=a.length) return s; // primary BO remains first
+    [a[i],a[j]]=[a[j],a[i]]; return a;
+  });
+  const save=()=>{setBusy(true);setPreview(null);
+    fetch(groupUrl,{method:"POST",credentials:"same-origin",
+      headers:{"Content-Type":"application/json","X-CSRFToken":csrf()},
+      body:JSON.stringify({build_ids:order})})
+    .then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.error||"Save failed");return d;})
+    .then(d=>{setOrder(d.build_ids||order);setMsg("Shared Allocation Group and sequence saved.");})
+    .catch(err=>setMsg(String(err))).finally(()=>setBusy(false));
+  };
+  const analyze=()=>{setBusy(true);setMsg("");
+    fetch(previewUrl,{credentials:"same-origin"}).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.error||"Preview failed");return d;})
+    .then(setPreview).catch(err=>setMsg(String(err))).finally(()=>setBusy(false));
+  };
+
+  const byId={}; (data?.builds||[]).forEach(b=>byId[b.pk]=b);
+  const box={padding:"10px",border:"1px solid #bbb",borderRadius:"5px",marginBottom:"10px"};
+  const section=(title,rows,kind)=>{
+    if(!rows?.length)return null;
+    return e("div",{style:box},
+      e("strong",null,`${title} (${rows.length})`),
+      ...rows.map((r,i)=>e("div",{key:i,style:{padding:"8px 0",borderTop:i?"1px solid #ddd":"none"}},
+        e("div",null,e("strong",null,`${r.build} — ${r.part}`)),
+        r.stock_id?e("div",null,`Stock #${r.stock_id} • ${r.location||"Unknown location"} • Allocate ${r.allocate_qty} • Spillage reserve ${r.spillage||0}`):null,
+        r.projected_before!=null?e("div",null,`Projected package qty: ${r.projected_before} → ${r.projected_after}`):null,
+        r.stock_items?e("div",null,`Stock: ${r.stock_items.map(x=>`#${x.stock_id} (${x.qty})`).join(", ")}`):null,
+        r.message?e("div",null,r.message):null,
+        kind!=="easy" && kind!=="insufficient" ? e("label",{style:{display:"block",marginTop:"5px"}},
+          e("input",{type:"checkbox",disabled:true})," Approve exception (enabled in Commit version)") : null
+      )));
+  };
+
+  return e("div",{style:{padding:"12px"}},
+    e("div",{style:box},
+      e("strong",null,"V0.2.1 — Shared Allocation Group"),
+      e("p",null,"Select BOs at the same physical assembly location which will run sequentially. Order matters: the projected remaining quantity of a physical package is carried forward to the next BO."),
+      e("p",null,"Actual InvenTree allocation remains BOM quantity only; BOM + expected spillage is reserved only for package-selection planning.")),
+    data?e("div",{style:box},
+      e("strong",null,"Sequence"),
+      ...order.map((id,i)=>e("div",{key:id,style:{display:"flex",gap:"6px",alignItems:"center",padding:"5px 0"}},
+        e("span",{style:{minWidth:"28px"}},`${i+1}.`),
+        e("span",{style:{flex:1}},byId[id]?.label||`BO ${id}`,id===buildId?" (current BO)":""),
+        id!==buildId?e("button",{onClick:()=>move(id,-1),disabled:i<=1},"↑"):null,
+        id!==buildId?e("button",{onClick:()=>move(id,1),disabled:i===order.length-1},"↓"):null,
+        id!==buildId?e("button",{onClick:()=>remove(id)},"Remove"):null)),
+      e("div",{style:{marginTop:"10px",maxHeight:"220px",overflow:"auto"}},
+        e("strong",null,"Add BO"),
+        ...(data.builds||[]).filter(b=>!order.includes(b.pk)).map(b=>e("div",{key:b.pk},
+          e("button",{onClick:()=>add(b.pk),style:{margin:"3px 0"}},"+ ",b.label)))),
+      e("div",{style:{marginTop:"10px",display:"flex",gap:"8px"}},
+        e("button",{onClick:save,disabled:busy},"Save Group + Sequence"),
+        e("button",{onClick:analyze,disabled:busy},"Analyze / Preview"))):null,
+    msg?e("div",{style:box},msg):null,
+    preview?e("div",null,
+      e("div",{style:box},e("strong",null,"Preview only — no allocations have been changed"),
+        e("div",null,"Sequence: ",preview.group.map(x=>x.label).join(" → "))),
+      section("Easy Allocations",preview.easy,"easy"),
+      section("Spillage Warnings",preview.spillage,"warning"),
+      section("Location Warnings",preview.location,"warning"),
+      section("Multiple Stock Item Warnings",preview.multi,"warning"),
+      section("Insufficient Stock / No Automatic Allocation",preview.insufficient,"insufficient"),
+      e("div",{style:box},e("strong",null,"Commit"),
+        e("p",null,"Commit is intentionally disabled in v0.2.1. This build is for validating grouping, sequence, projected package depletion, proposed stock selection and warning classification before we allow inventory allocations to be written."))):null
+  );
+}
