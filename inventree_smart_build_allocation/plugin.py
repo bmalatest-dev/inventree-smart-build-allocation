@@ -10,7 +10,7 @@ from .rules import rank_stock_items, planned_spillage, is_hand_placement, locati
 GROUP_TTL = 60 * 60 * 24 * 7
 
 def _group_key(build_id):
-    return f"smartbuildallocation:shared-group:v024:{int(build_id)}"
+    return f"smartbuildallocation:shared-group:v025:{int(build_id)}"
 
 def _build_label(build):
     ref = getattr(build, "reference", None) or f"BO-{build.pk}"
@@ -313,7 +313,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v024.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v025.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
