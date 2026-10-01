@@ -11,7 +11,7 @@ from .rules import rank_stock_items, planned_spillage, is_hand_placement, locati
 GROUP_TTL = 60 * 60 * 24 * 7
 
 def _group_key(build_id):
-    return f"smartbuildallocation:shared-group:v0212:{int(build_id)}"
+    return f"smartbuildallocation:shared-group:v0213:{int(build_id)}"
 
 def _build_label(build):
     ref = getattr(build, "reference", None) or f"BO-{build.pk}"
@@ -409,6 +409,63 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     by_stock_id = {s.pk: s for s in stock_items}
                     ranked = [by_stock_id[sid] for sid in override_by_id if sid in by_stock_id]
 
+                # Explicit multi-package selection takes precedence over optimization.
+                if override_by_id and len(override_by_id) > 1:
+                    if abs(sum(override_by_id.values()) - outstanding) > 1e-6:
+                        result["insufficient"].append({
+                            "build": _build_label(build), "build_id": build.pk,
+                            "build_url": _build_url(build), "build_part": _build_part(build),
+                            "part": str(part), "part_id": part.pk, "part_url": _part_url(part),
+                            "override_key": override_key, "line_id": line_id,
+                            "required": outstanding, "available": sum(override_by_id.values()),
+                            "message": "Manual selection must total the outstanding BOM quantity.",
+                            "stock_options": self._stock_options(stock_items, group_ids),
+                        })
+                        continue
+                    by_stock = {s.pk: s for s in stock_items}
+                    picks = []
+                    for sid, qty in override_by_id.items():
+                        stock = by_stock.get(sid)
+                        if stock is None or is_unreceived(stock):
+                            picks = []
+                            break
+                        before = projected.get(sid, self._projected_start_quantity(stock, group_ids))
+                        if qty > before or qty <= 0:
+                            picks = []
+                            break
+                        picks.append((stock, qty, before))
+                    if not picks:
+                        result["insufficient"].append({
+                            "build": _build_label(build), "build_id": build.pk,
+                            "build_url": _build_url(build), "build_part": _build_part(build),
+                            "part": str(part), "part_id": part.pk, "part_url": _part_url(part),
+                            "override_key": override_key, "line_id": line_id,
+                            "required": outstanding,
+                            "message": "Manual StockItem selection exceeds available stock or includes unreceived stock.",
+                            "stock_options": self._stock_options(stock_items, group_ids),
+                        })
+                        continue
+                    for stock, qty, before in picks:
+                        projected[stock.pk] = before - qty
+                    row = {
+                        "build": _build_label(build), "build_id": build.pk,
+                        "build_url": _build_url(build), "build_part": _build_part(build),
+                        "sequence": seq, "part": str(part), "part_id": part.pk,
+                        "part_url": _part_url(part), "line_id": line_id,
+                        "override_key": override_key, "commit_key": commit_key,
+                        "manual_override": True, "bom_qty": outstanding,
+                        "allocate_qty": outstanding, "spillage": spill,
+                        "stock_options": self._stock_options(stock_items, group_ids),
+                        "stock_items": [
+                            {"stock_id": s.pk, "batch_id": _batch_id(s),
+                             "qty": qty, "location": location_name(s)}
+                            for s, qty, _ in picks
+                        ],
+                        "message": "Manual split across multiple packages. Review location and spillage reserves before committing.",
+                    }
+                    result["multi"].append(row)
+                    continue
+
                 # First prefer a single package that satisfies BOM + spillage.
                 chosen = None
                 warning = None
@@ -520,6 +577,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                             "required": outstanding,
                             "available_automatic": outstanding - remaining,
                             "options": manual_options,
+                            "stock_options": self._stock_options(stock_items, group_ids),
                             "message": "Automatic allocation cannot satisfy the requirement, but stock exists which requires a user decision.",
                         })
                     else:
@@ -530,6 +588,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                             "override_key": override_key, "line_id": line_id,
                             "required": outstanding,
                             "available": outstanding - remaining,
+                            "stock_options": self._stock_options(stock_items, group_ids),
                             "message": "Actual BOM quantity cannot be satisfied.",
                         })
 
@@ -789,7 +848,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v0212.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v0213.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),

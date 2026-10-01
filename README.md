@@ -91,3 +91,9 @@ No database migration is required. Shared Allocation Groups are cached for seven
 - Commit now submits the exact selected Preview rows the user confirmed instead of re-running the optimizer and requiring identical recommendations.
 - Backend still revalidates every selected row under database locks against the live Build Order, BuildLine, outstanding BOM quantity, StockItem part, and actual InvenTree available quantity.
 - Each BuildItem write is immediately read back and verified inside the atomic transaction; verification failure rolls back the complete commit.
+
+## v0.2.13
+- Always-visible Restore Recommendation for manually overridden rows.
+- Manual split allocation editor with multiple StockItems and per-package quantities, including manual/insufficient rows.
+- Explicit manual splits are shown under Multiple Stock Item Warnings and require approval.
+- Commit messages are repeated beside the bottom Commit controls.
