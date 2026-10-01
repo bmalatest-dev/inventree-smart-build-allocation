@@ -369,6 +369,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                 "quantity": self._projected_start_quantity(stock, group_ids),
                 "physical_quantity": _num(getattr(stock, "quantity", 0)),
                 "outside_allocated": outside,
+                "unallocated_quantity": max(_num(getattr(stock, "quantity", 0)) - outside, 0),
                 "location": loc or "Unknown",
                 "reason": reason,
             })
@@ -401,8 +402,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
         # Track outstanding BOM demand on later builds. Planned spillage must
         # never make an otherwise satisfiable later BOM appear short.
         future_demand = {}
+        demand_by_build = {}
         for b in ordered_builds:
-            for _, part, qty in self._required_lines(b):
+            demand_by_build[b.pk] = self._required_lines(b)
+            for _, part, qty in demand_by_build[b.pk]:
                 future_demand[part.pk] = future_demand.get(part.pk, 0) + qty
 
         for seq, build in enumerate(ordered_builds, start=1):
@@ -412,13 +415,13 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             # The current BO's existing allocations count as its own demand;
             # preserve only future BO demand when reserving discretionary spill.
             this_demand = {}
-            for _, current_part, qty in self._required_lines(build):
+            for _, current_part, qty in demand_by_build[build.pk]:
                 this_demand[current_part.pk] = this_demand.get(current_part.pk, 0) + qty
             later_demand = {part_id: max(qty - this_demand.get(part_id, 0), 0)
                             for part_id, qty in future_demand.items()}
             self._apply_existing_group_allocations(build, projected, group_ids, later_demand)
 
-            for line, part, outstanding in self._required_lines(build):
+            for line, part, outstanding in demand_by_build[build.pk]:
                 stock_items = self._stock_for_part(part)
                 if not stock_items:
                     result["insufficient"].append({
@@ -440,6 +443,9 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                                    and not is_unreceived(s))
                 spillage_budget = max(usable_total - outstanding - future_demand[part.pk], 0)
                 reservable_spill = min(spill, spillage_budget)
+                demand_detail = (f"Current BOM outstanding {outstanding:g}; later BO BOM demand "
+                                 f"{future_demand[part.pk]:g}; projected usable physical stock "
+                                 f"{usable_total:g}; spillage reserve budget {spillage_budget:g}.")
                 ranked = rank_stock_items(
                     [s for s in stock_items if self._outside_group_allocated_quantity(s, group_ids) <= 0],
                     part, outstanding,
@@ -604,7 +610,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     )
                     lowloc = (loc or "").lower()
                     if warning == "spillage":
-                        row["message"] = "BOM quantity can be satisfied, but full spillage cannot be reserved."
+                        row["message"] = "BOM quantity can be satisfied, but full spillage cannot be reserved. " + demand_detail
                         result["spillage"].append(row)
                     elif not lowloc:
                         row["message"] = "Stock location is unknown; user review is required."
@@ -682,7 +688,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                             "required": outstanding,
                             "available": outstanding - remaining,
                             "stock_options": self._stock_options(stock_items, group_ids),
-                            "message": "Actual BOM quantity cannot be satisfied.",
+                            "message": "Actual BOM quantity cannot be satisfied. " + demand_detail,
                         })
 
         return result
@@ -950,7 +956,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v0218.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v0219.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
