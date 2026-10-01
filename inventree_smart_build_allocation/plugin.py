@@ -385,6 +385,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
         ordered_builds = [by_id[x] for x in group_ids if x in by_id]
 
         projected = {}  # stock pk -> projected quantity remaining after prior BOs + spillage
+        # Retain package affinity within a sequential group. An already-used
+        # physical package takes priority when it can satisfy the next BOM,
+        # even when another package could satisfy BOM plus spillage.
+        preferred_package = {}  # part pk -> stock pk
         result = {
             "group": [{
                 "pk": b.pk, "label": _build_label(b), "url": _build_url(b),
@@ -420,6 +424,14 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             later_demand = {part_id: max(qty - this_demand.get(part_id, 0), 0)
                             for part_id, qty in future_demand.items()}
             self._apply_existing_group_allocations(build, projected, group_ids, later_demand)
+            # Existing allocations anchor package reuse for later builds.
+            from build.models import BuildItem
+            for existing in (BuildItem.objects.filter(build_line__build=build)
+                             .select_related("build_line__bom_item__sub_part", "stock_item")
+                             .order_by("pk")):
+                existing_part = getattr(getattr(existing.build_line, "bom_item", None), "sub_part", None)
+                if existing_part is not None and existing.stock_item_id is not None:
+                    preferred_package.setdefault(existing_part.pk, existing.stock_item_id)
 
             for line, part, outstanding in demand_by_build[build.pk]:
                 stock_items = self._stock_for_part(part)
@@ -561,10 +573,27 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                         "required": outstanding, "stock_options": self._stock_options(stock_items, group_ids),
                         "message": "Selected StockItem is reserved for a Build Order outside this group or is otherwise unavailable."})
                     continue
-                # First prefer a single package that satisfies BOM + spillage.
+                # Reuse the physical package already selected earlier in this
+                # group before searching for a fresh package with full spillage.
+                # Explicit overrides always take precedence.
                 chosen = None
                 warning = None
-                for stock in ranked:
+                affinity_id = preferred_package.get(part.pk) if not override_by_id else None
+                if affinity_id is not None:
+                    for stock in ranked:
+                        if stock.pk == affinity_id:
+                            q = projected.get(stock.pk, self._projected_start_quantity(stock, group_ids))
+                            if q >= outstanding:
+                                chosen = stock
+                                # The later demand reserve still applies: if
+                                # there is no discretionary spill budget, warn.
+                                if (q < outstanding + spill + future_demand[part.pk]
+                                        or spillage_budget < spill):
+                                    warning = "spillage"
+                            break
+                # Without an eligible reused package, prefer a package which
+                # covers both the BOM and the full planned spillage.
+                for stock in ranked if chosen is None else []:
                     q = projected.get(stock.pk, self._projected_start_quantity(stock, group_ids))
                     target = override_by_id.get(stock.pk, outstanding) if override_by_id else outstanding
                     if q >= target + spill and spillage_budget >= spill and target >= outstanding:
@@ -582,6 +611,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                             break
 
                 if chosen is not None:
+                    preferred_package[part.pk] = chosen.pk
                     before = projected.get(chosen.pk, self._projected_start_quantity(chosen, group_ids))
                     reserve = outstanding + (spill if warning != "spillage" and before >= outstanding + spill and spillage_budget >= spill else 0)
                     after = max(before - reserve, 0)
@@ -956,7 +986,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v0219.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v0220.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
