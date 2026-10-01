@@ -97,3 +97,8 @@ No database migration is required. Shared Allocation Groups are cached for seven
 - Manual split allocation editor with multiple StockItems and per-package quantities, including manual/insufficient rows.
 - Explicit manual splits are shown under Multiple Stock Item Warnings and require approval.
 - Commit messages are repeated beside the bottom Commit controls.
+
+## v0.2.14
+- Import is_unreceived in manual split Preview branch (fixes NameError).
+- Show overallocated amount and explain disabled Apply button.
+- Clear stale Preview and selections before recalculating, preventing commit from an outdated Preview after errors.

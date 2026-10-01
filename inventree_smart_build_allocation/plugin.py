@@ -11,7 +11,7 @@ from .rules import rank_stock_items, planned_spillage, is_hand_placement, locati
 GROUP_TTL = 60 * 60 * 24 * 7
 
 def _group_key(build_id):
-    return f"smartbuildallocation:shared-group:v0213:{int(build_id)}"
+    return f"smartbuildallocation:shared-group:v0214:{int(build_id)}"
 
 def _build_label(build):
     ref = getattr(build, "reference", None) or f"BO-{build.pk}"
@@ -411,6 +411,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
                 # Explicit multi-package selection takes precedence over optimization.
                 if override_by_id and len(override_by_id) > 1:
+                    from .rules import is_unreceived
                     if abs(sum(override_by_id.values()) - outstanding) > 1e-6:
                         result["insufficient"].append({
                             "build": _build_label(build), "build_id": build.pk,
@@ -848,7 +849,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v0213.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v0214.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
