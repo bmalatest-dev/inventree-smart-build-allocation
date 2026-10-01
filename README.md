@@ -102,3 +102,11 @@ No database migration is required. Shared Allocation Groups are cached for seven
 - Import is_unreceived in manual split Preview branch (fixes NameError).
 - Show overallocated amount and explain disabled Apply button.
 - Clear stale Preview and selections before recalculating, preventing commit from an outdated Preview after errors.
+
+
+## v0.2.17 regression fixes
+- Block unapproved selected warnings before opening confirmation (server still validates at commit).
+- Exclude any physical package allocated to a BO outside the selected sequential group, even if partially allocated; show the allocation conflict and BO owner in manual-review information.
+- Plan future outstanding BOM demand ahead of discretionary spillage, so earlier spillage reserves cannot create false shortages on later BOs.
+- Recheck outside-group allocation conflicts at commit.
+- See TEST-REPRODUCTION-v0.2.17.md for exact user-reported scenarios and expected results.

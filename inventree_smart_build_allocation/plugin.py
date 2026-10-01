@@ -6,7 +6,7 @@ from django.urls import path
 from plugin import InvenTreePlugin
 from plugin.mixins import  SettingsMixin, UserInterfaceMixin, UrlsMixin
 from . import PLUGIN_VERSION
-from .rules import rank_stock_items, planned_spillage, is_hand_placement, location_name, available_quantity
+from .rules import rank_stock_items, planned_spillage, is_hand_placement, location_name, available_quantity, is_unreceived
 
 GROUP_TTL = 60 * 60 * 24 * 7
 
@@ -245,9 +245,11 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             return 0
         physical = _num(getattr(stock, "quantity", 0), 0)
         outside = self._outside_group_allocated_quantity(stock, group_ids)
-        return max(physical - outside, 0)
+        # The entire physical package travels with its outside BO; the
+        # unallocated balance is not available to this independent group.
+        return 0 if outside > 0 else max(physical, 0)
 
-    def _apply_existing_group_allocations(self, build, projected, group_ids):
+    def _apply_existing_group_allocations(self, build, projected, group_ids, future_demand=None):
         """Carry existing allocations for this BO through the package projection.
 
         Existing BOM allocations are real reservations, but because selected BOs
@@ -284,7 +286,9 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     part = getattr(line, "part", None)
                 if part is not None:
                     spill, _ = planned_spillage(part, getattr(build, "quantity", 1))
-                    if projected[stock.pk] >= qty + spill:
+                    # Do not consume stock needed to satisfy later BO BOM lines.
+                    later = (future_demand or {}).get(part.pk, 0)
+                    if projected[stock.pk] >= qty + spill + later:
                         reserve += spill
                 spill_applied.add(line.pk)
 
@@ -306,6 +310,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
         if is_consumed(stock):
             warnings.append("Already consumed by a Build Order")
             selectable = False
+        outside = self._outside_group_allocated_quantity(stock, group_ids)
+        if outside > 0:
+            warnings.append(f"ALLOCATED TO ANOTHER BUILD: {outside:g} units; entire package unavailable")
+            selectable = False
         if is_unreceived(stock):
             warnings.append("Ordered / awaiting receipt")
             selectable = False
@@ -318,7 +326,9 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
         return {
             "stock_id": stock.pk,
             "batch_id": _batch_id(stock),
-            "quantity": available_quantity(stock),
+            "quantity": self._projected_start_quantity(stock, group_ids),
+            "physical_quantity": _num(getattr(stock, "quantity", 0)),
+            "outside_allocated": outside,
             "location": loc or "Unknown",
             "recommended": recommended,
             "selectable": selectable,
@@ -342,7 +352,12 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             loc = location_name(stock)
             if is_consumed(stock):
                 continue
-            if is_unreceived(stock):
+            outside = self._outside_group_allocated_quantity(stock, group_ids)
+            if outside > 0:
+                from build.models import BuildItem
+                owners = sorted({str(item.build_line.build.reference) for item in BuildItem.objects.filter(stock_item=stock).select_related("build_line__build") if item.build_line and item.build_line.build_id not in group_ids})
+                reason = f"ALLOCATED TO ANOTHER BUILD ({', '.join(owners)}): {outside:g} allocated; entire physical package reserved. Release allocation or establish valid sequential reuse."
+            elif is_unreceived(stock):
                 reason = "Stock is ordered / awaiting receipt and requires a user decision."
             elif is_out_for_assembly(stock) and not stock_used_by_group(stock, group_ids):
                 reason = "Stock is Out-for-Assembly for a BO outside this Shared Allocation Group."
@@ -351,7 +366,9 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             options.append({
                 "stock_id": stock.pk,
                 "batch_id": _batch_id(stock),
-                "quantity": available_quantity(stock),
+                "quantity": self._projected_start_quantity(stock, group_ids),
+                "physical_quantity": _num(getattr(stock, "quantity", 0)),
+                "outside_allocated": outside,
                 "location": loc or "Unknown",
                 "reason": reason,
             })
@@ -381,11 +398,25 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "notes": [],
         }
 
+        # Track outstanding BOM demand on later builds. Planned spillage must
+        # never make an otherwise satisfiable later BOM appear short.
+        future_demand = {}
+        for b in ordered_builds:
+            for _, part, qty in self._required_lines(b):
+                future_demand[part.pk] = future_demand.get(part.pk, 0) + qty
+
         for seq, build in enumerate(ordered_builds, start=1):
             # First account for allocations which already exist on this BO.
             # This preserves the physical package for later BOs in the group,
             # while carrying forward BOM consumption + expected spillage.
-            self._apply_existing_group_allocations(build, projected, group_ids)
+            # The current BO's existing allocations count as its own demand;
+            # preserve only future BO demand when reserving discretionary spill.
+            this_demand = {}
+            for _, current_part, qty in self._required_lines(build):
+                this_demand[current_part.pk] = this_demand.get(current_part.pk, 0) + qty
+            later_demand = {part_id: max(qty - this_demand.get(part_id, 0), 0)
+                            for part_id, qty in future_demand.items()}
+            self._apply_existing_group_allocations(build, projected, group_ids, later_demand)
 
             for line, part, outstanding in self._required_lines(build):
                 stock_items = self._stock_for_part(part)
@@ -400,8 +431,18 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     continue
 
                 spill, spill_source = planned_spillage(part, getattr(build, "quantity", 1))
+                future_demand[part.pk] = max(future_demand.get(part.pk, 0) - outstanding, 0)
+                # Only reserve discretionary spillage from stock in excess of
+                # all outstanding BOM requirements for this part.
+                usable_total = sum(max(projected.get(s.pk, self._projected_start_quantity(s, group_ids)), 0)
+                                   for s in self._stock_for_part(part)
+                                   if self._outside_group_allocated_quantity(s, group_ids) <= 0
+                                   and not is_unreceived(s))
+                spillage_budget = max(usable_total - outstanding - future_demand[part.pk], 0)
+                reservable_spill = min(spill, spillage_budget)
                 ranked = rank_stock_items(
-                    stock_items, part, outstanding,
+                    [s for s in stock_items if self._outside_group_allocated_quantity(s, group_ids) <= 0],
+                    part, outstanding,
                     group_build_ids=group_ids,
                     projected_quantities=projected,
                 )
@@ -417,7 +458,9 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                 }
                 if override_by_id:
                     by_stock_id = {s.pk: s for s in stock_items}
-                    ranked = [by_stock_id[sid] for sid in override_by_id if sid in by_stock_id]
+                    ranked = [by_stock_id[sid] for sid in override_by_id
+                              if sid in by_stock_id and
+                              self._outside_group_allocated_quantity(by_stock_id[sid], group_ids) <= 0]
 
                 # Explicit multi-package selection takes precedence over optimization.
                 if override_by_id and len(override_by_id) > 1:
@@ -460,18 +503,23 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     spare = {s.pk: max(before - qty, 0) for s, qty, before in picks}
                     spill_by_stock = {s.pk: 0 for s, _, _ in picks}
                     spill_left = spill
+                    if spillage_budget < spill:
+                        spill_left = spill - min(spill, spillage_budget)
+                    to_reserve = min(spill, spillage_budget)
+                    spill_to_allocate = to_reserve
                     for stock, qty, before in picks:
-                        if spare[stock.pk] >= spill_left:
-                            spill_by_stock[stock.pk] = spill_left
-                            spill_left = 0
+                        if spare[stock.pk] >= spill_to_allocate:
+                            spill_by_stock[stock.pk] = spill_to_allocate
+                            spill_to_allocate = 0
                             break
-                    if spill_left:
+                    if spill_to_allocate:
                         for stock, qty, before in picks:
-                            take = min(spare[stock.pk], spill_left)
+                            take = min(spare[stock.pk], spill_to_allocate)
                             spill_by_stock[stock.pk] += take
-                            spill_left -= take
-                            if spill_left <= 0:
+                            spill_to_allocate -= take
+                            if spill_to_allocate <= 0:
                                 break
+                    spill_left += spill_to_allocate
                     for stock, qty, before in picks:
                         projected[stock.pk] = before - qty - spill_by_stock[stock.pk]
                     row = {
@@ -500,13 +548,21 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     result["multi"].append(row)
                     continue
 
+                if override_by_id and not ranked:
+                    result["insufficient"].append({
+                        "build": _build_label(build), "build_id": build.pk, "build_url": _build_url(build),
+                        "build_part": _build_part(build), "part": str(part), "part_id": part.pk,
+                        "part_url": _part_url(part), "override_key": override_key, "line_id": line_id,
+                        "required": outstanding, "stock_options": self._stock_options(stock_items, group_ids),
+                        "message": "Selected StockItem is reserved for a Build Order outside this group or is otherwise unavailable."})
+                    continue
                 # First prefer a single package that satisfies BOM + spillage.
                 chosen = None
                 warning = None
                 for stock in ranked:
                     q = projected.get(stock.pk, self._projected_start_quantity(stock, group_ids))
                     target = override_by_id.get(stock.pk, outstanding) if override_by_id else outstanding
-                    if q >= target + spill and target >= outstanding:
+                    if q >= target + spill and spillage_budget >= spill and target >= outstanding:
                         chosen = stock
                         break
 
@@ -522,7 +578,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
                 if chosen is not None:
                     before = projected.get(chosen.pk, self._projected_start_quantity(chosen, group_ids))
-                    reserve = outstanding + (spill if before >= outstanding + spill else 0)
+                    reserve = outstanding + (spill if warning != "spillage" and before >= outstanding + spill and spillage_budget >= spill else 0)
                     after = max(before - reserve, 0)
                     projected[chosen.pk] = after
                     loc = location_name(chosen)
@@ -540,6 +596,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                         "allocate_qty": outstanding,
                         "hand_placement": is_hand_placement(part),
                     }
+                    if reserve < outstanding + spill:
+                        warning = "spillage"
+                        row["spillage_reserved"] = reserve - outstanding
+                        row["spillage_shortfall"] = spill - (reserve - outstanding)
                     row["stock_options"] = self._stock_options(
                         stock_items, group_ids, recommended_ids=[chosen.pk]
                     )
@@ -799,6 +859,8 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                                 f"Stock #{sid} has been consumed or is awaiting receipt. "
                                 "Run Analyze / Preview again."
                             )
+                        if self._outside_group_allocated_quantity(stock, group_ids) > 0:
+                            raise ValueError(f"Stock #{sid} is allocated to another Build Order outside this group. Release it or establish valid sequential reuse.")
                         if getattr(stock, "part_id", None) != int(row["part_id"]):
                             raise ValueError(
                                 f"Stock #{sid} no longer matches {row.get('part')}."
@@ -888,7 +950,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v0216.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v0217.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
