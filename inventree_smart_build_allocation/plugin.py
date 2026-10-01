@@ -11,7 +11,7 @@ from .rules import rank_stock_items, planned_spillage, is_hand_placement, locati
 GROUP_TTL = 60 * 60 * 24 * 7
 
 def _group_key(build_id):
-    return f"smartbuildallocation:shared-group:v028:{int(build_id)}"
+    return f"smartbuildallocation:shared-group:v029:{int(build_id)}"
 
 def _build_label(build):
     ref = getattr(build, "reference", None) or f"BO-{build.pk}"
@@ -487,53 +487,21 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
         return rows
 
     def _create_build_item(self, build, line, stock, quantity):
-        """Create a native InvenTree BuildItem allocation.
-
-        InvenTree 1.6 exposes BuildItem as the stock allocation record. The
-        field names are inspected so this remains tolerant of minor model
-        naming differences.
-        """
+        """Create / extend an allocation using InvenTree native semantics."""
         from build.models import BuildItem
 
-        field_names = {f.name for f in BuildItem._meta.fields}
-        values = {}
-
-        if "build_line" in field_names:
-            values["build_line"] = line
-        elif "line" in field_names:
-            values["line"] = line
-        elif "bom_item" in field_names and line is not None:
-            values["bom_item"] = getattr(line, "bom_item", None)
-
-        if "stock_item" in field_names:
-            values["stock_item"] = stock
-        elif "stock" in field_names:
-            values["stock"] = stock
-
-        if "quantity" in field_names:
-            values["quantity"] = quantity
-
-        # Some InvenTree versions retain a direct build FK as well.
-        if "build" in field_names:
-            values["build"] = build
-
-        required = []
-        if not any(k in values for k in ("build_line", "line", "bom_item")):
-            required.append("build line / BOM item")
-        if not any(k in values for k in ("stock_item", "stock")):
-            required.append("stock item")
-        if "quantity" not in values:
-            required.append("quantity")
-        if required:
-            raise RuntimeError(
-                "Unsupported BuildItem model; missing allocation fields: "
-                + ", ".join(required)
-            )
-
-        item = BuildItem(**values)
-        item.full_clean()
-        item.save()
-        return item
+        build_item, created = BuildItem.objects.get_or_create(
+            build_line=line,
+            stock_item=stock,
+            install_into=None,
+        )
+        if created:
+            build_item.quantity = quantity
+        else:
+            build_item.quantity += quantity
+        build_item.full_clean()
+        build_item.save()
+        return build_item
 
     def commit_view(self, request, build_id):
         if request.method != "POST":
@@ -620,13 +588,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
                     # Recalculate current outstanding BOM quantity after locking.
                     required = _num(getattr(line, "quantity", 0), 0)
-                    allocated = _num(getattr(line, "allocated", 0), 0)
-                    if allocated == 0:
-                        for attr in ("allocated_quantity", "allocation_count"):
-                            value = getattr(line, attr, None)
-                            if value is not None and not callable(value):
-                                allocated = _num(value, 0)
-                                break
+                    allocated_value = getattr(line, "allocated", 0)
+                    if callable(allocated_value):
+                        allocated_value = allocated_value()
+                    allocated = _num(allocated_value, 0)
                     outstanding = max(required - allocated, 0)
 
                     requested = _num(row.get("allocate_qty"), 0)
@@ -682,7 +647,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                 "selected_lines": len(selected),
                 "skipped_lines": skipped,
                 "created": created,
-                "message": f"{len(created)} allocation record(s) created across {len(selected)} selected BOM line(s).",
+                "message": f"Commit successful — {len(created)} allocation record(s) created / updated across {len(selected)} selected BOM line(s).",
             })
 
         except (ValueError, BuildLine.DoesNotExist) as exc:
@@ -695,7 +660,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
     def preview_view(self, request, build_id):
         if request.method not in ("GET", "POST"):
-            return JsonResponse({"error": "Preview supports allocation review in v0.2.8"}, status=405)
+            return JsonResponse({"error": "Preview supports allocation review in v0.2.9"}, status=405)
         overrides = {}
         if request.method == "POST":
             try:
@@ -724,7 +689,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v028.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v029.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
