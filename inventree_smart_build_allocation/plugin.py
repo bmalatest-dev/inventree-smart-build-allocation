@@ -240,6 +240,9 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
         subtracted here; they are consumed in sequence by
         _apply_existing_group_allocations().
         """
+        from .rules import is_consumed
+        if is_consumed(stock):
+            return 0
         physical = _num(getattr(stock, "quantity", 0), 0)
         outside = self._outside_group_allocated_quantity(stock, group_ids)
         return max(physical - outside, 0)
@@ -289,15 +292,20 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
     def _stock_for_part(self, part):
         from stock.models import StockItem
-        qs = StockItem.objects.filter(part=part).select_related("location", "part")
+        # Historical StockItems consumed by a BO retain their original quantity.
+        # They must not enter recommendations, overrides or projections.
+        qs = StockItem.objects.filter(part=part, consumed_by__isnull=True).select_related("location", "part")
         return list(qs)
 
     def _stock_option(self, stock, group_ids, recommended=False):
-        from .rules import is_unreceived, is_out_for_assembly, stock_used_by_group
+        from .rules import is_unreceived, is_consumed, is_out_for_assembly, stock_used_by_group
         loc = location_name(stock)
         low = (loc or "").lower()
         warnings = []
         selectable = True
+        if is_consumed(stock):
+            warnings.append("Already consumed by a Build Order")
+            selectable = False
         if is_unreceived(stock):
             warnings.append("Ordered / awaiting receipt")
             selectable = False
@@ -328,10 +336,12 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
     def _manual_stock_options(self, stock_items, group_ids):
         """Stock which exists but must never be selected automatically."""
-        from .rules import is_unreceived, is_out_for_assembly, stock_used_by_group
+        from .rules import is_unreceived, is_consumed, is_out_for_assembly, stock_used_by_group
         options = []
         for stock in stock_items:
             loc = location_name(stock)
+            if is_consumed(stock):
+                continue
             if is_unreceived(stock):
                 reason = "Stock is ordered / awaiting receipt and requires a user decision."
             elif is_out_for_assembly(stock) and not stock_used_by_group(stock, group_ids):
@@ -411,7 +421,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
                 # Explicit multi-package selection takes precedence over optimization.
                 if override_by_id and len(override_by_id) > 1:
-                    from .rules import is_unreceived
+                    from .rules import is_unreceived, is_consumed
                     if abs(sum(override_by_id.values()) - outstanding) > 1e-6:
                         result["insufficient"].append({
                             "build": _build_label(build), "build_id": build.pk,
@@ -427,7 +437,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     picks = []
                     for sid, qty in override_by_id.items():
                         stock = by_stock.get(sid)
-                        if stock is None or is_unreceived(stock):
+                        if stock is None or is_consumed(stock) or is_unreceived(stock):
                             picks = []
                             break
                         before = projected.get(sid, self._projected_start_quantity(stock, group_ids))
@@ -783,6 +793,12 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                         stock = stocks.get(sid)
                         if stock is None:
                             raise ValueError(f"Stock #{sid} no longer exists.")
+                        from .rules import is_consumed, is_unreceived
+                        if is_consumed(stock) or is_unreceived(stock):
+                            raise ValueError(
+                                f"Stock #{sid} has been consumed or is awaiting receipt. "
+                                "Run Analyze / Preview again."
+                            )
                         if getattr(stock, "part_id", None) != int(row["part_id"]):
                             raise ValueError(
                                 f"Stock #{sid} no longer matches {row.get('part')}."
@@ -872,7 +888,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v0215.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v0216.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),

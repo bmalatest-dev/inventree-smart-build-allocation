@@ -14,6 +14,14 @@ def is_component_room(stock): return "component room" in location_name(stock).lo
 def is_rework_room(stock): return "rework" in location_name(stock).lower()
 def is_storage_room(stock): return "storage" in location_name(stock).lower()
 def is_out_for_assembly(stock): return location_name(stock).lower().startswith("out-for-assembly")
+def is_consumed(stock):
+    """InvenTree retains historical consumed StockItems and their original quantity.
+
+    The consumed_by relation identifies a package consumed by a Build Order;
+    such a package is no longer physical stock eligible for allocation.
+    """
+    return getattr(stock, "consumed_by_id", None) is not None or getattr(stock, "consumed_by", None) is not None
+
 def is_unreceived(stock):
     loc=location_name(stock).lower()
     return any(x in loc for x in ("ordered to be received","to be received","awaiting receipt","incoming"))
@@ -111,7 +119,7 @@ def rank_stock_items(stock_items,required_part=None,required_qty=0,group_build_i
     candidates=[]
     for stock in list(stock_items):
         group_use=stock_used_by_group(stock,group)
-        if is_unreceived(stock):
+        if is_consumed(stock) or is_unreceived(stock):
             continue
         if is_out_for_assembly(stock) and not group_use:
             continue
