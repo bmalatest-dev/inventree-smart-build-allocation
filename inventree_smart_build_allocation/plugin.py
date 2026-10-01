@@ -1,5 +1,6 @@
 import json
 from django.core.cache import cache
+from django.db import transaction
 from django.http import JsonResponse
 from django.urls import path
 from plugin import InvenTreePlugin
@@ -10,7 +11,7 @@ from .rules import rank_stock_items, planned_spillage, is_hand_placement, locati
 GROUP_TTL = 60 * 60 * 24 * 7
 
 def _group_key(build_id):
-    return f"smartbuildallocation:shared-group:v027:{int(build_id)}"
+    return f"smartbuildallocation:shared-group:v028:{int(build_id)}"
 
 def _build_label(build):
     ref = getattr(build, "reference", None) or f"BO-{build.pk}"
@@ -63,6 +64,14 @@ def _build_url(build):
 def _part_url(part):
     return f"/web/part/{part.pk}/"
 
+def _batch_id(stock):
+    """Human-facing package identifier used by Per Vices."""
+    for attr in ("batch", "batch_code", "batch_id"):
+        value = getattr(stock, attr, None)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
 def _build_part(build):
     part = getattr(build, "part", None)
     if part is None:
@@ -96,6 +105,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
         return [
             path("group/<int:build_id>/", self.group_view, name="smart-allocation-group"),
             path("preview/<int:build_id>/", self.preview_view, name="smart-allocation-preview"),
+            path("commit/<int:build_id>/", self.commit_view, name="smart-allocation-commit"),
         ]
 
     def _get_group(self, build_id):
@@ -246,6 +256,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             warnings.append("Non-preferred location")
         return {
             "stock_id": stock.pk,
+            "batch_id": _batch_id(stock),
             "quantity": available_quantity(stock),
             "location": loc or "Unknown",
             "recommended": recommended,
@@ -276,6 +287,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                 continue
             options.append({
                 "stock_id": stock.pk,
+                "batch_id": _batch_id(stock),
                 "quantity": available_quantity(stock),
                 "location": loc or "Unknown",
                 "reason": reason,
@@ -311,8 +323,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                 stock_items = self._stock_for_part(part)
                 if not stock_items:
                     result["insufficient"].append({
-                        "build": _build_label(build), "build_id": build.pk,
-                        "part": str(part), "part_id": part.pk,
+                        "build": _build_label(build), "build_id": build.pk, "build_url": _build_url(build),
+                        "build_part": _build_part(build),
+                        "part": str(part), "part_id": part.pk, "part_url": _part_url(part),
+                        "line_id": getattr(line, "pk", None),
                         "required": outstanding, "message": "No StockItems exist for this part.",
                     })
                     continue
@@ -324,7 +338,9 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     projected_quantities=projected,
                 )
 
-                override_key = f"{build.pk}:{part.pk}"
+                line_id = getattr(line, "pk", None)
+                override_key = f"{build.pk}:{line_id or ('part-' + str(part.pk))}"
+                commit_key = override_key
                 override_rows = overrides.get(override_key, [])
                 override_by_id = {
                     int(x.get("stock_id")): _num(x.get("quantity"), 0)
@@ -365,8 +381,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                         "build": _build_label(build), "build_id": build.pk, "build_url": _build_url(build),
                         "build_part": _build_part(build), "sequence": seq,
                         "part": str(part), "part_id": part.pk, "part_url": _part_url(part),
-                        "stock_id": chosen.pk, "location": loc,
-                        "override_key": override_key, "manual_override": bool(override_by_id),
+                        "line_id": line_id,
+                        "stock_id": chosen.pk, "batch_id": _batch_id(chosen), "location": loc,
+                        "override_key": override_key, "commit_key": commit_key,
+                        "manual_override": bool(override_by_id),
                         "bom_qty": outstanding, "spillage": spill,
                         "spillage_source": spill_source,
                         "projected_before": before, "projected_after": after,
@@ -417,12 +435,13 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                         "build": _build_label(build), "build_id": build.pk, "build_url": _build_url(build),
                         "build_part": _build_part(build), "sequence": seq,
                         "part": str(part), "part_id": part.pk, "part_url": _part_url(part),
-                        "override_key": override_key,
+                        "line_id": line_id,
+                        "override_key": override_key, "commit_key": commit_key,
                         "bom_qty": outstanding, "spillage": spill,
                         "allocate_qty": outstanding,
                         "hand_placement": is_hand_placement(part),
                         "stock_items": [
-                            {"stock_id": s.pk, "qty": take, "location": location_name(s)}
+                            {"stock_id": s.pk, "batch_id": _batch_id(s), "qty": take, "location": location_name(s)}
                             for s, take, _ in picks
                         ],
                     }
@@ -439,7 +458,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                             "build": _build_label(build), "build_id": build.pk, "build_url": _build_url(build),
                             "build_part": _build_part(build),
                             "part": str(part), "part_id": part.pk, "part_url": _part_url(part),
-                            "override_key": override_key,
+                            "override_key": override_key, "line_id": line_id,
                             "required": outstanding,
                             "available_automatic": outstanding - remaining,
                             "options": manual_options,
@@ -450,7 +469,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                             "build": _build_label(build), "build_id": build.pk, "build_url": _build_url(build),
                             "build_part": _build_part(build),
                             "part": str(part), "part_id": part.pk, "part_url": _part_url(part),
-                            "override_key": override_key,
+                            "override_key": override_key, "line_id": line_id,
                             "required": outstanding,
                             "available": outstanding - remaining,
                             "message": "Actual BOM quantity cannot be satisfied.",
@@ -458,9 +477,225 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
         return result
 
+    def _allocation_rows(self, preview):
+        rows = {}
+        for section in ("easy", "spillage", "location", "multi"):
+            for row in preview.get(section, []):
+                key = row.get("commit_key")
+                if key:
+                    rows[key] = (section, row)
+        return rows
+
+    def _create_build_item(self, build, line, stock, quantity):
+        """Create a native InvenTree BuildItem allocation.
+
+        InvenTree 1.6 exposes BuildItem as the stock allocation record. The
+        field names are inspected so this remains tolerant of minor model
+        naming differences.
+        """
+        from build.models import BuildItem
+
+        field_names = {f.name for f in BuildItem._meta.fields}
+        values = {}
+
+        if "build_line" in field_names:
+            values["build_line"] = line
+        elif "line" in field_names:
+            values["line"] = line
+        elif "bom_item" in field_names and line is not None:
+            values["bom_item"] = getattr(line, "bom_item", None)
+
+        if "stock_item" in field_names:
+            values["stock_item"] = stock
+        elif "stock" in field_names:
+            values["stock"] = stock
+
+        if "quantity" in field_names:
+            values["quantity"] = quantity
+
+        # Some InvenTree versions retain a direct build FK as well.
+        if "build" in field_names:
+            values["build"] = build
+
+        required = []
+        if not any(k in values for k in ("build_line", "line", "bom_item")):
+            required.append("build line / BOM item")
+        if not any(k in values for k in ("stock_item", "stock")):
+            required.append("stock item")
+        if "quantity" not in values:
+            required.append("quantity")
+        if required:
+            raise RuntimeError(
+                "Unsupported BuildItem model; missing allocation fields: "
+                + ", ".join(required)
+            )
+
+        item = BuildItem(**values)
+        item.full_clean()
+        item.save()
+        return item
+
+    def commit_view(self, request, build_id):
+        if request.method != "POST":
+            return JsonResponse({"error": "POST required"}, status=405)
+
+        try:
+            payload = json.loads(request.body.decode("utf-8") or "{}")
+        except Exception:
+            return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+        selected = set(str(x) for x in (payload.get("selected") or []))
+        approved = set(str(x) for x in (payload.get("approved") or []))
+        overrides = payload.get("overrides") or {}
+
+        if not selected:
+            return JsonResponse({"error": "No allocations are selected."}, status=400)
+
+        try:
+            preview = self._preview(build_id, overrides=overrides)
+            available_rows = self._allocation_rows(preview)
+
+            missing = sorted(selected - set(available_rows))
+            if missing:
+                return JsonResponse({
+                    "error": "Preview is stale. One or more selected allocations are no longer available. Run Analyze / Preview again.",
+                    "stale": missing,
+                }, status=409)
+
+            # Warning rows require explicit approval at the time of commit.
+            unapproved = sorted(
+                key for key in selected
+                if available_rows[key][0] != "easy" and key not in approved
+            )
+            if unapproved:
+                return JsonResponse({
+                    "error": "One or more selected warning allocations have not been approved.",
+                    "unapproved": unapproved,
+                }, status=400)
+
+            from build.models import Build, BuildLine
+            from stock.models import StockItem
+
+            created = []
+            skipped = 0
+
+            # Atomic commit: either all selected allocations are created, or none are.
+            with transaction.atomic():
+                # Lock all relevant rows before final validation.
+                build_ids = {int(available_rows[k][1]["build_id"]) for k in selected}
+                builds = {
+                    b.pk: b for b in Build.objects.select_for_update().filter(pk__in=build_ids)
+                }
+
+                stock_ids = set()
+                for key in selected:
+                    row = available_rows[key][1]
+                    if row.get("stock_id"):
+                        stock_ids.add(int(row["stock_id"]))
+                    for s in row.get("stock_items") or []:
+                        stock_ids.add(int(s["stock_id"]))
+
+                stocks = {
+                    s.pk: s for s in StockItem.objects.select_for_update().filter(pk__in=stock_ids)
+                }
+
+                # Track quantities within this transaction so two selected rows cannot
+                # over-allocate the same physical package.
+                remaining = {sid: available_quantity(stock) for sid, stock in stocks.items()}
+
+                for key in selected:
+                    section, row = available_rows[key]
+                    build = builds.get(int(row["build_id"]))
+                    if build is None or _closed_build(build):
+                        raise ValueError(f"{row.get('build')} is complete, cancelled, or unavailable.")
+
+                    line_id = row.get("line_id")
+                    if not line_id:
+                        raise ValueError(
+                            f"Cannot commit {row.get('build')} / {row.get('part')}: build line is unavailable."
+                        )
+                    line = BuildLine.objects.select_for_update().select_related(
+                        "bom_item", "bom_item__sub_part"
+                    ).get(pk=line_id, build=build)
+
+                    # Recalculate current outstanding BOM quantity after locking.
+                    required = _num(getattr(line, "quantity", 0), 0)
+                    allocated = _num(getattr(line, "allocated", 0), 0)
+                    if allocated == 0:
+                        for attr in ("allocated_quantity", "allocation_count"):
+                            value = getattr(line, attr, None)
+                            if value is not None and not callable(value):
+                                allocated = _num(value, 0)
+                                break
+                    outstanding = max(required - allocated, 0)
+
+                    requested = _num(row.get("allocate_qty"), 0)
+                    if requested <= 0 or outstanding + 1e-9 < requested:
+                        raise ValueError(
+                            f"{row.get('build')} / {row.get('part')} changed since Preview. "
+                            "Run Analyze / Preview again."
+                        )
+
+                    allocations = []
+                    if row.get("stock_id"):
+                        allocations = [(int(row["stock_id"]), requested)]
+                    else:
+                        allocations = [
+                            (int(x["stock_id"]), _num(x.get("qty"), 0))
+                            for x in (row.get("stock_items") or [])
+                        ]
+
+                    if abs(sum(q for _, q in allocations) - requested) > 1e-6:
+                        raise ValueError(
+                            f"Allocation quantities for {row.get('build')} / {row.get('part')} no longer match."
+                        )
+
+                    for sid, qty in allocations:
+                        stock = stocks.get(sid)
+                        if stock is None:
+                            raise ValueError(f"Stock #{sid} no longer exists.")
+                        if getattr(stock, "part_id", None) != int(row["part_id"]):
+                            raise ValueError(
+                                f"Stock #{sid} no longer matches {row.get('part')}."
+                            )
+                        if qty <= 0 or remaining.get(sid, 0) + 1e-9 < qty:
+                            raise ValueError(
+                                f"Stock #{sid} no longer has sufficient available quantity. "
+                                "Run Analyze / Preview again."
+                            )
+
+                        item = self._create_build_item(build, line, stock, qty)
+                        remaining[sid] -= qty
+                        created.append({
+                            "pk": item.pk,
+                            "build": _build_label(build),
+                            "part": row.get("part"),
+                            "stock_id": sid,
+                            "batch_id": _batch_id(stock),
+                            "quantity": qty,
+                        })
+
+            skipped = max(len(available_rows) - len(selected), 0)
+            return JsonResponse({
+                "ok": True,
+                "created_count": len(created),
+                "selected_lines": len(selected),
+                "skipped_lines": skipped,
+                "created": created,
+                "message": f"{len(created)} allocation record(s) created across {len(selected)} selected BOM line(s).",
+            })
+
+        except (ValueError, BuildLine.DoesNotExist) as exc:
+            return JsonResponse({"error": str(exc)}, status=409)
+        except Exception as exc:
+            return JsonResponse(
+                {"error": f"Commit failed; no selected allocations were written: {type(exc).__name__}: {exc}"},
+                status=500,
+            )
+
     def preview_view(self, request, build_id):
         if request.method not in ("GET", "POST"):
-            return JsonResponse({"error": "Preview is read-only in v0.2.7"}, status=405)
+            return JsonResponse({"error": "Preview supports allocation review in v0.2.8"}, status=405)
         overrides = {}
         if request.method == "POST":
             try:
@@ -489,11 +724,12 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v027.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v028.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
                 "group_url": f"/plugin/{self.SLUG}/group/{int(target_id)}/",
                 "preview_url": f"/plugin/{self.SLUG}/preview/{int(target_id)}/",
+                "commit_url": f"/plugin/{self.SLUG}/commit/{int(target_id)}/",
             },
         }]
