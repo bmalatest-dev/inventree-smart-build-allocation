@@ -6,7 +6,7 @@ from django.urls import path
 from plugin import InvenTreePlugin
 from plugin.mixins import  SettingsMixin, UserInterfaceMixin, UrlsMixin
 from . import PLUGIN_VERSION
-from .rules import rank_stock_items, planned_spillage, is_hand_placement, location_name, available_quantity, is_unreceived
+from .rules import rank_stock_items, planned_spillage, is_hand_placement, location_name, available_quantity, is_unreceived, is_consumed
 
 GROUP_TTL = 60 * 60 * 24 * 7
 
@@ -464,7 +464,6 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
                 # Explicit multi-package selection takes precedence over optimization.
                 if override_by_id and len(override_by_id) > 1:
-                    from .rules import is_unreceived, is_consumed
                     if abs(sum(override_by_id.values()) - outstanding) > 1e-6:
                         result["insufficient"].append({
                             "build": _build_label(build), "build_id": build.pk,
@@ -724,6 +723,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             return JsonResponse({"error": "Invalid JSON"}, status=400)
 
         selected = set(str(x) for x in (payload.get("selected") or []))
+        group_ids = self._get_group(build_id)
         approved = set(str(x) for x in (payload.get("approved") or []))
         overrides = payload.get("overrides") or {}
         selected_rows_payload = payload.get("selected_rows") or {}
@@ -950,7 +950,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v0217.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v0218.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
