@@ -11,7 +11,7 @@ from .rules import rank_stock_items, planned_spillage, is_hand_placement, locati
 GROUP_TTL = 60 * 60 * 24 * 7
 
 def _group_key(build_id):
-    return f"smartbuildallocation:shared-group:v0211:{int(build_id)}"
+    return f"smartbuildallocation:shared-group:v0212:{int(build_id)}"
 
 def _build_label(build):
     ref = getattr(build, "reference", None) or f"BO-{build.pk}"
@@ -573,20 +573,42 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
         selected = set(str(x) for x in (payload.get("selected") or []))
         approved = set(str(x) for x in (payload.get("approved") or []))
         overrides = payload.get("overrides") or {}
+        selected_rows_payload = payload.get("selected_rows") or {}
 
         if not selected:
             return JsonResponse({"error": "No allocations are selected."}, status=400)
 
         try:
-            preview = self._preview(build_id, overrides=overrides)
-            available_rows = self._allocation_rows(preview)
-
-            missing = sorted(selected - set(available_rows))
-            if missing:
-                return JsonResponse({
-                    "error": "Preview is stale. One or more selected allocations are no longer available. Run Analyze / Preview again.",
-                    "stale": missing,
-                }, status=409)
+            # Use the exact rows from the Preview the user confirmed. Re-running
+            # the optimizer here can legitimately produce a different recommendation
+            # for a sequential Shared Allocation Group and caused false "stale"
+            # failures in v0.2.11.
+            #
+            # Safety does not depend on trusting these rows: every selected row is
+            # revalidated below under database locks against the live BuildLine,
+            # StockItem part, outstanding BOM quantity and actual InvenTree
+            # availability before anything is written.
+            available_rows = {}
+            for key in selected:
+                entry = selected_rows_payload.get(key)
+                if not isinstance(entry, dict):
+                    return JsonResponse({
+                        "error": "Selected Preview details are missing. Run Analyze / Preview again.",
+                        "stale": [key],
+                    }, status=409)
+                section = str(entry.get("section") or "")
+                row = entry.get("row")
+                if section not in ("easy", "spillage", "location", "multi") or not isinstance(row, dict):
+                    return JsonResponse({
+                        "error": "Selected Preview details are invalid. Run Analyze / Preview again.",
+                        "stale": [key],
+                    }, status=409)
+                if str(row.get("commit_key") or "") != key:
+                    return JsonResponse({
+                        "error": "Selected Preview no longer matches the confirmed allocation.",
+                        "stale": [key],
+                    }, status=409)
+                available_rows[key] = (section, row)
 
             # Warning rows require explicit approval at the time of commit.
             unapproved = sorted(
@@ -688,7 +710,26 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                                 "Run Analyze / Preview again."
                             )
 
+                        before_allocated = sum(
+                            _num(getattr(existing, "quantity", 0), 0)
+                            for existing in BuildItem.objects.filter(build_line=line, stock_item=stock)
+                        )
                         item = self._create_build_item(build, line, stock, qty)
+
+                        # Verify the database write immediately. If this does not
+                        # read back exactly, the surrounding atomic transaction rolls
+                        # back all selected allocations.
+                        item.refresh_from_db()
+                        after_allocated = sum(
+                            _num(getattr(existing, "quantity", 0), 0)
+                            for existing in BuildItem.objects.filter(build_line=line, stock_item=stock)
+                        )
+                        if after_allocated + 1e-9 < before_allocated + qty:
+                            raise ValueError(
+                                f"Allocation verification failed for {row.get('build')} / "
+                                f"{row.get('part')} / Stock #{sid}. No allocations were committed."
+                            )
+
                         remaining[sid] -= qty
                         created.append({
                             "pk": item.pk,
@@ -719,7 +760,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
     def preview_view(self, request, build_id):
         if request.method not in ("GET", "POST"):
-            return JsonResponse({"error": "Preview supports allocation review in v0.2.9"}, status=405)
+            return JsonResponse({"error": "Preview supports allocation review in v0.2.12"}, status=405)
         overrides = {}
         if request.method == "POST":
             try:
@@ -748,7 +789,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v0211.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v0212.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
