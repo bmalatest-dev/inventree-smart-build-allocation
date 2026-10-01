@@ -11,7 +11,7 @@ from .rules import rank_stock_items, planned_spillage, is_hand_placement, locati
 GROUP_TTL = 60 * 60 * 24 * 7
 
 def _group_key(build_id):
-    return f"smartbuildallocation:shared-group:v029:{int(build_id)}"
+    return f"smartbuildallocation:shared-group:v0210:{int(build_id)}"
 
 def _build_label(build):
     ref = getattr(build, "reference", None) or f"BO-{build.pk}"
@@ -195,43 +195,28 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
         })
 
     def _required_lines(self, build):
-        """Return outstanding component requirements using current InvenTree models."""
-        rows = []
-        try:
-            from build.models import BuildLine
-            lines = BuildLine.objects.filter(build=build).select_related("bom_item", "bom_item__sub_part")
-            for line in lines:
-                part = getattr(getattr(line, "bom_item", None), "sub_part", None)
-                if part is None:
-                    part = getattr(line, "part", None)
-                required = _num(getattr(line, "quantity", 0), 0)
-                allocated = _num(getattr(line, "allocated", 0), 0)
-                # Some versions expose allocated as a method/property elsewhere.
-                if allocated == 0:
-                    for attr in ("allocated_quantity", "allocation_count"):
-                        val = getattr(line, attr, None)
-                        if val is not None and not callable(val):
-                            allocated = _num(val, 0)
-                            break
-                outstanding = max(required - allocated, 0)
-                if part is not None and outstanding > 0:
-                    rows.append((line, part, outstanding))
-            if rows:
-                return rows
-        except Exception:
-            pass
+        """Return outstanding component requirements from native BuildItem allocations."""
+        from build.models import BuildItem, BuildLine
 
-        # Compatibility fallback: Build.required_parts.
-        try:
-            for item in list(build.required_parts):
-                part = item.get("part")
-                required = _num(item.get("quantity"), 0)
-                allocated = _num(item.get("allocated"), 0)
-                outstanding = max(required - allocated, 0)
-                if part is not None and outstanding > 0:
-                    rows.append((None, part, outstanding))
-        except Exception:
-            pass
+        rows = []
+        lines = BuildLine.objects.filter(build=build).select_related(
+            "bom_item", "bom_item__sub_part"
+        )
+        for line in lines:
+            part = getattr(getattr(line, "bom_item", None), "sub_part", None)
+            if part is None:
+                part = getattr(line, "part", None)
+
+            required = _num(getattr(line, "quantity", 0), 0)
+            allocated = sum(
+                _num(getattr(item, "quantity", 0), 0)
+                for item in BuildItem.objects.filter(build_line=line)
+            )
+            outstanding = max(required - allocated, 0)
+
+            if part is not None and outstanding > 0:
+                rows.append((line, part, outstanding))
+
         return rows
 
     def _stock_for_part(self, part):
@@ -588,10 +573,11 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
                     # Recalculate current outstanding BOM quantity after locking.
                     required = _num(getattr(line, "quantity", 0), 0)
-                    allocated_value = getattr(line, "allocated", 0)
-                    if callable(allocated_value):
-                        allocated_value = allocated_value()
-                    allocated = _num(allocated_value, 0)
+                    from build.models import BuildItem
+                    allocated = sum(
+                        _num(getattr(item, "quantity", 0), 0)
+                        for item in BuildItem.objects.filter(build_line=line)
+                    )
                     outstanding = max(required - allocated, 0)
 
                     requested = _num(row.get("allocate_qty"), 0)
@@ -689,7 +675,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v029.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v0210.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
