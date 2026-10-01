@@ -11,7 +11,7 @@ from .rules import rank_stock_items, planned_spillage, is_hand_placement, locati
 GROUP_TTL = 60 * 60 * 24 * 7
 
 def _group_key(build_id):
-    return f"smartbuildallocation:shared-group:v0214:{int(build_id)}"
+    return f"smartbuildallocation:shared-group:v0215:{int(build_id)}"
 
 def _build_label(build):
     ref = getattr(build, "reference", None) or f"BO-{build.pk}"
@@ -446,8 +446,24 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                             "stock_options": self._stock_options(stock_items, group_ids),
                         })
                         continue
+                    # Reserve planned spillage once per BOM line across split packages.
+                    spare = {s.pk: max(before - qty, 0) for s, qty, before in picks}
+                    spill_by_stock = {s.pk: 0 for s, _, _ in picks}
+                    spill_left = spill
                     for stock, qty, before in picks:
-                        projected[stock.pk] = before - qty
+                        if spare[stock.pk] >= spill_left:
+                            spill_by_stock[stock.pk] = spill_left
+                            spill_left = 0
+                            break
+                    if spill_left:
+                        for stock, qty, before in picks:
+                            take = min(spare[stock.pk], spill_left)
+                            spill_by_stock[stock.pk] += take
+                            spill_left -= take
+                            if spill_left <= 0:
+                                break
+                    for stock, qty, before in picks:
+                        projected[stock.pk] = before - qty - spill_by_stock[stock.pk]
                     row = {
                         "build": _build_label(build), "build_id": build.pk,
                         "build_url": _build_url(build), "build_part": _build_part(build),
@@ -459,10 +475,17 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                         "stock_options": self._stock_options(stock_items, group_ids),
                         "stock_items": [
                             {"stock_id": s.pk, "batch_id": _batch_id(s),
-                             "qty": qty, "location": location_name(s)}
-                            for s, qty, _ in picks
+                             "qty": qty, "location": location_name(s),
+                             "projected_before": before,
+                             "spillage_reserved": spill_by_stock[s.pk],
+                             "projected_after": projected[s.pk]}
+                            for s, qty, before in picks
                         ],
-                        "message": "Manual split across multiple packages. Review location and spillage reserves before committing.",
+                        "spillage_reserved": spill - spill_left,
+                        "spillage_shortfall": spill_left,
+                        "message": ("Manual split: spillage shortfall remains. " if spill_left
+                                    else "Manual split: full spillage reserve planned. ")
+                                   + "Review package locations and projections before committing.",
                     }
                     result["multi"].append(row)
                     continue
@@ -849,7 +872,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v0214.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v0215.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
