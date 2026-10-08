@@ -110,3 +110,8 @@ No database migration is required. Shared Allocation Groups are cached for seven
 - Plan future outstanding BOM demand ahead of discretionary spillage, so earlier spillage reserves cannot create false shortages on later BOs.
 - Recheck outside-group allocation conflicts at commit.
 - See TEST-REPRODUCTION-v0.2.17.md for exact user-reported scenarios and expected results.
+
+
+## v0.2.21 safety safeguard
+
+Stock Items with current status **Attention Needed** or **Damaged** are explicitly blocked from Smart Build Allocation, even if InvenTree reports those default statuses as available. The safeguard applies to automatic recommendations, manual selection, Preview, and is re-checked under database lock at Commit.

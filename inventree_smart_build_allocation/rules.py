@@ -2,6 +2,29 @@
 PASSIVE_FOOTPRINT_SPILLAGE = {"0201":200,"0402":100,"0603":50,"0805":25,"1206":20,"1210":20}
 LOW_COST_REEL_THRESHOLD = 0.15
 
+BLOCKED_STOCK_STATUS_LABELS = {"attention needed", "damaged"}
+
+def stock_status_text(stock):
+    """Return the human-readable current StockItem status where possible."""
+    status = getattr(stock, "status", None)
+    candidates = [getattr(stock, "status_text", None), getattr(status, "label", None), getattr(status, "name", None)]
+    try:
+        from stock.status_codes import StockStatus
+        resolved = StockStatus(status)
+        candidates.extend([getattr(resolved, "label", None), getattr(resolved, "name", None)])
+    except Exception:
+        pass
+    candidates.append(status if isinstance(status, str) else None)
+    for value in candidates:
+        if value not in (None, ""):
+            return _txt(value)
+    return ""
+
+def has_blocked_stock_status(stock):
+    """Per Vices safeguard: never allocate Attention Needed or Damaged stock."""
+    text = stock_status_text(stock).strip().lower().replace("_", " ").replace("-", " ")
+    return text in BLOCKED_STOCK_STATUS_LABELS
+
 def _txt(v): return str(v or "").strip()
 def _num(v, default=0.0):
     try: return float(getattr(v,"amount",v))
@@ -119,7 +142,7 @@ def rank_stock_items(stock_items,required_part=None,required_qty=0,group_build_i
     candidates=[]
     for stock in list(stock_items):
         group_use=stock_used_by_group(stock,group)
-        if is_consumed(stock) or is_unreceived(stock):
+        if is_consumed(stock) or is_unreceived(stock) or has_blocked_stock_status(stock):
             continue
         if is_out_for_assembly(stock) and not group_use:
             continue

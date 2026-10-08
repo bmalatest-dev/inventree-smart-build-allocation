@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from inventree_smart_build_allocation.rules import rank_stock_items
+from inventree_smart_build_allocation.rules import rank_stock_items, has_blocked_stock_status
 
 def stock(pk,qty,loc,price=1.0,packaging="cut tape",part_pk=1):
     return SimpleNamespace(pk=pk,quantity=qty,purchase_price=price,packaging=packaging,part=SimpleNamespace(pk=part_pk),location=SimpleNamespace(name=loc))
@@ -13,3 +13,14 @@ def test_low_cost_reel_preferred():
     assert rank_stock_items([stock(1,100,"Component Room",0.10,"cut tape"),stock(2,500,"Component Room",0.10,"reel")],SimpleNamespace(pk=1),50)[0].pk==2
 def test_exact_part_before_variant():
     assert rank_stock_items([stock(1,100,"Component Room",part_pk=2),stock(2,100,"Component Room",part_pk=1)],SimpleNamespace(pk=1),50)[0].pk==2
+
+
+def test_attention_needed_excluded():
+    bad=stock(1,100,"Component Room"); bad.status_text="Attention Needed"
+    good=stock(2,100,"Component Room"); good.status_text="OK"
+    assert [x.pk for x in rank_stock_items([bad,good],SimpleNamespace(pk=1),50)] == [2]
+
+def test_damaged_excluded():
+    bad=stock(1,100,"Component Room"); bad.status_text="Damaged"
+    assert rank_stock_items([bad],SimpleNamespace(pk=1),50) == []
+    assert has_blocked_stock_status(bad)

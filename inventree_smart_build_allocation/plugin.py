@@ -6,7 +6,7 @@ from django.urls import path
 from plugin import InvenTreePlugin
 from plugin.mixins import  SettingsMixin, UserInterfaceMixin, UrlsMixin
 from . import PLUGIN_VERSION
-from .rules import rank_stock_items, planned_spillage, is_hand_placement, location_name, available_quantity, is_unreceived, is_consumed
+from .rules import rank_stock_items, planned_spillage, is_hand_placement, location_name, available_quantity, is_unreceived, is_consumed, has_blocked_stock_status, stock_status_text
 
 GROUP_TTL = 60 * 60 * 24 * 7
 
@@ -302,7 +302,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
         return list(qs)
 
     def _stock_option(self, stock, group_ids, recommended=False):
-        from .rules import is_unreceived, is_consumed, is_out_for_assembly, stock_used_by_group
+        from .rules import is_unreceived, is_consumed, is_out_for_assembly, stock_used_by_group, has_blocked_stock_status, stock_status_text
         loc = location_name(stock)
         low = (loc or "").lower()
         warnings = []
@@ -316,6 +316,9 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             selectable = False
         if is_unreceived(stock):
             warnings.append("Ordered / awaiting receipt")
+            selectable = False
+        if has_blocked_stock_status(stock):
+            warnings.append(f"BLOCKED STATUS: {stock_status_text(stock) or 'Attention Needed / Damaged'}")
             selectable = False
         if is_out_for_assembly(stock) and not stock_used_by_group(stock, group_ids):
             warnings.append("Out-for-Assembly outside this group")
@@ -346,7 +349,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
     def _manual_stock_options(self, stock_items, group_ids):
         """Stock which exists but must never be selected automatically."""
-        from .rules import is_unreceived, is_consumed, is_out_for_assembly, stock_used_by_group
+        from .rules import is_unreceived, is_consumed, is_out_for_assembly, stock_used_by_group, has_blocked_stock_status, stock_status_text
         options = []
         for stock in stock_items:
             loc = location_name(stock)
@@ -359,6 +362,8 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                 reason = f"ALLOCATED TO ANOTHER BUILD ({', '.join(owners)}): {outside:g} allocated; entire physical package reserved. Release allocation or establish valid sequential reuse."
             elif is_unreceived(stock):
                 reason = "Stock is ordered / awaiting receipt and requires a user decision."
+            elif has_blocked_stock_status(stock):
+                reason = f"Stock status is {stock_status_text(stock)} and is blocked from build allocation."
             elif is_out_for_assembly(stock) and not stock_used_by_group(stock, group_ids):
                 reason = "Stock is Out-for-Assembly for a BO outside this Shared Allocation Group."
             else:
@@ -452,7 +457,8 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                 usable_total = sum(max(projected.get(s.pk, self._projected_start_quantity(s, group_ids)), 0)
                                    for s in self._stock_for_part(part)
                                    if self._outside_group_allocated_quantity(s, group_ids) <= 0
-                                   and not is_unreceived(s))
+                                   and not is_unreceived(s)
+                                   and not has_blocked_stock_status(s))
                 spillage_budget = max(usable_total - outstanding - future_demand[part.pk], 0)
                 reservable_spill = min(spill, spillage_budget)
                 demand_detail = (f"Current BOM outstanding {outstanding:g}; later BO BOM demand "
@@ -478,7 +484,8 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     by_stock_id = {s.pk: s for s in stock_items}
                     ranked = [by_stock_id[sid] for sid in override_by_id
                               if sid in by_stock_id and
-                              self._outside_group_allocated_quantity(by_stock_id[sid], group_ids) <= 0]
+                              self._outside_group_allocated_quantity(by_stock_id[sid], group_ids) <= 0 and
+                              not has_blocked_stock_status(by_stock_id[sid])]
 
                 # Explicit multi-package selection takes precedence over optimization.
                 if override_by_id and len(override_by_id) > 1:
@@ -497,7 +504,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     picks = []
                     for sid, qty in override_by_id.items():
                         stock = by_stock.get(sid)
-                        if stock is None or is_consumed(stock) or is_unreceived(stock):
+                        if stock is None or is_consumed(stock) or is_unreceived(stock) or has_blocked_stock_status(stock):
                             picks = []
                             break
                         before = projected.get(sid, self._projected_start_quantity(stock, group_ids))
@@ -889,11 +896,16 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                         stock = stocks.get(sid)
                         if stock is None:
                             raise ValueError(f"Stock #{sid} no longer exists.")
-                        from .rules import is_consumed, is_unreceived
+                        from .rules import is_consumed, is_unreceived, has_blocked_stock_status, stock_status_text
                         if is_consumed(stock) or is_unreceived(stock):
                             raise ValueError(
                                 f"Stock #{sid} has been consumed or is awaiting receipt. "
                                 "Run Analyze / Preview again."
+                            )
+                        if has_blocked_stock_status(stock):
+                            raise ValueError(
+                                f"Stock #{sid} has status {stock_status_text(stock)} and cannot be allocated. "
+                                "Change the stock status only after the material has been dispositioned, then run Analyze / Preview again."
                             )
                         if self._outside_group_allocated_quantity(stock, group_ids) > 0:
                             raise ValueError(f"Stock #{sid} is allocated to another Build Order outside this group. Release it or establish valid sequential reuse.")
