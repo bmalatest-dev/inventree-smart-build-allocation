@@ -318,8 +318,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             warnings.append("Ordered / awaiting receipt")
             selectable = False
         if has_blocked_stock_status(stock):
-            warnings.append(f"BLOCKED STATUS: {stock_status_text(stock) or 'Attention Needed / Damaged'}")
-            selectable = False
+            warnings.append(
+                f"WARNING STATUS: {stock_status_text(stock) or 'Attention Needed / Damaged'}; "
+                "excluded from automatic allocation; manual allocation permitted"
+            )
         if is_out_for_assembly(stock) and not stock_used_by_group(stock, group_ids):
             warnings.append("Out-for-Assembly outside this group")
         if not loc:
@@ -363,7 +365,10 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             elif is_unreceived(stock):
                 reason = "Stock is ordered / awaiting receipt and requires a user decision."
             elif has_blocked_stock_status(stock):
-                reason = f"Stock status is {stock_status_text(stock)} and is blocked from build allocation."
+                reason = (
+                    f"WARNING STATUS: {stock_status_text(stock)}; excluded from automatic allocation, "
+                    "but manual allocation is permitted."
+                )
             elif is_out_for_assembly(stock) and not stock_used_by_group(stock, group_ids):
                 reason = "Stock is Out-for-Assembly for a BO outside this Shared Allocation Group."
             else:
@@ -482,10 +487,11 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                 }
                 if override_by_id:
                     by_stock_id = {s.pk: s for s in stock_items}
+                    # Explicit manual overrides may select Attention Needed / Damaged stock.
+                    # These statuses remain excluded from automatic allocation.
                     ranked = [by_stock_id[sid] for sid in override_by_id
                               if sid in by_stock_id and
-                              self._outside_group_allocated_quantity(by_stock_id[sid], group_ids) <= 0 and
-                              not has_blocked_stock_status(by_stock_id[sid])]
+                              self._outside_group_allocated_quantity(by_stock_id[sid], group_ids) <= 0]
 
                 # Explicit multi-package selection takes precedence over optimization.
                 if override_by_id and len(override_by_id) > 1:
@@ -504,7 +510,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     picks = []
                     for sid, qty in override_by_id.items():
                         stock = by_stock.get(sid)
-                        if stock is None or is_consumed(stock) or is_unreceived(stock) or has_blocked_stock_status(stock):
+                        if stock is None or is_consumed(stock) or is_unreceived(stock):
                             picks = []
                             break
                         before = projected.get(sid, self._projected_start_quantity(stock, group_ids))
@@ -902,10 +908,14 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                                 f"Stock #{sid} has been consumed or is awaiting receipt. "
                                 "Run Analyze / Preview again."
                             )
-                        if has_blocked_stock_status(stock):
+                        # Attention Needed / Damaged are deliberately blocked from automatic
+                        # allocation, but an explicit manual override is allowed. Re-check the
+                        # live status here so automatic commits remain protected if status changed
+                        # after Preview.
+                        if has_blocked_stock_status(stock) and not row.get("manual_override"):
                             raise ValueError(
-                                f"Stock #{sid} has status {stock_status_text(stock)} and cannot be allocated. "
-                                "Change the stock status only after the material has been dispositioned, then run Analyze / Preview again."
+                                f"Stock #{sid} has status {stock_status_text(stock)} and cannot be automatically allocated. "
+                                "Use an explicit manual allocation if this stock has been reviewed and is acceptable."
                             )
                         if self._outside_group_allocated_quantity(stock, group_ids) > 0:
                             raise ValueError(f"Stock #{sid} is allocated to another Build Order outside this group. Release it or establish valid sequential reuse.")

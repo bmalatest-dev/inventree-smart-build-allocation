@@ -114,4 +114,4 @@ No database migration is required. Shared Allocation Groups are cached for seven
 
 ## v0.2.21 safety safeguard
 
-Stock Items with current status **Attention Needed** or **Damaged** are explicitly blocked from Smart Build Allocation, even if InvenTree reports those default statuses as available. The safeguard applies to automatic recommendations, manual selection, Preview, and is re-checked under database lock at Commit.
+Stock Items with current status **Attention Needed** or **Damaged** are explicitly excluded from automatic Smart Build Allocation, even if InvenTree reports those default statuses as available. They remain available for an explicit manual allocation, with a warning so the user must make a deliberate decision. Commit re-checks the live status under the database lock: automatic allocations remain blocked, while explicit manual overrides are permitted.
