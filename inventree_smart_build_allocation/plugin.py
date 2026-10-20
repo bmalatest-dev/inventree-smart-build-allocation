@@ -1052,7 +1052,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v0226.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v0227.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
