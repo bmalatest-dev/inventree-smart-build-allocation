@@ -294,11 +294,18 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
             projected[stock.pk] = max(projected[stock.pk] - reserve, 0)
 
-    def _stock_for_part(self, part):
+    def _stock_for_part(self, part, include_variants=False):
+        from django.db.models import Q
         from stock.models import StockItem
         # Historical StockItems consumed by a BO retain their original quantity.
         # They must not enter recommendations, overrides or projections.
-        qs = StockItem.objects.filter(part=part, consumed_by__isnull=True).select_related("location", "part")
+        # Variant stock is deliberately opt-in: it is only introduced when the
+        # exact BOM part cannot satisfy demand, and is always sent through the
+        # explicit review / approval path rather than Easy Allocations.
+        query = Q(part=part)
+        if include_variants:
+            query |= Q(part__variant_of=part)
+        qs = StockItem.objects.filter(query, consumed_by__isnull=True).select_related("location", "part")
         return list(qs)
 
     def _stock_option(self, stock, group_ids, recommended=False):
@@ -405,6 +412,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                 "part": _build_part(b), "sequence": i + 1
             } for i, b in enumerate(ordered_builds)],
             "easy": [],
+            "variant": [],
             "spillage": [],
             "location": [],
             "multi": [],
@@ -444,7 +452,19 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     preferred_package.setdefault(existing_part.pk, existing.stock_item_id)
 
             for line, part, outstanding in demand_by_build[build.pk]:
-                stock_items = self._stock_for_part(part)
+                exact_stock_items = self._stock_for_part(part)
+                exact_usable = sum(
+                    max(projected.get(s.pk, self._projected_start_quantity(s, group_ids)), 0)
+                    for s in exact_stock_items
+                    if self._outside_group_allocated_quantity(s, group_ids) <= 0
+                    and not is_unreceived(s)
+                    and not has_blocked_stock_status(s)
+                )
+                # Exact stock always wins. Variants are considered only when exact
+                # physical stock cannot satisfy the BOM quantity, and any proposal
+                # using a variant requires explicit human approval.
+                variant_review = exact_usable + 1e-9 < outstanding
+                stock_items = self._stock_for_part(part, include_variants=variant_review)
                 if not stock_items:
                     result["insufficient"].append({
                         "build": _build_label(build), "build_id": build.pk, "build_url": _build_url(build),
@@ -460,7 +480,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                 # Only reserve discretionary spillage from stock in excess of
                 # all outstanding BOM requirements for this part.
                 usable_total = sum(max(projected.get(s.pk, self._projected_start_quantity(s, group_ids)), 0)
-                                   for s in self._stock_for_part(part)
+                                   for s in stock_items
                                    if self._outside_group_allocated_quantity(s, group_ids) <= 0
                                    and not is_unreceived(s)
                                    and not has_blocked_stock_status(s))
@@ -652,7 +672,17 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                         stock_items, group_ids, recommended_ids=[chosen.pk]
                     )
                     lowloc = (loc or "").lower()
-                    if warning == "spillage":
+                    chosen_is_variant = getattr(chosen, "part_id", None) != part.pk
+                    if chosen_is_variant:
+                        row["variant_part"] = str(getattr(chosen, "part", ""))
+                        row["variant_part_id"] = getattr(chosen, "part_id", None)
+                        row["variant_part_url"] = _part_url(chosen.part) if getattr(chosen, "part", None) else ""
+                        row["message"] = (
+                            f"Variant stock proposed: {row['variant_part']} for BOM component {part}. "
+                            "Review and approve this substitution before allocation."
+                        )
+                        result["variant"].append(row)
+                    elif warning == "spillage":
                         row["message"] = "BOM quantity can be satisfied, but full spillage cannot be reserved. " + demand_detail
                         result["spillage"].append(row)
                     elif not lowloc:
@@ -702,7 +732,16 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                             for s, take, _ in picks
                         ],
                     }
-                    if is_hand_placement(part):
+                    variant_picks = [s for s, _, _ in picks if getattr(s, "part_id", None) != part.pk]
+                    if variant_picks:
+                        row["variant_parts"] = sorted({str(s.part) for s in variant_picks})
+                        row["message"] = (
+                            "Variant stock is required to satisfy this BOM line: "
+                            + ", ".join(row["variant_parts"])
+                            + ". Review and approve the substitution before allocation."
+                        )
+                        result["variant"].append(row)
+                    elif is_hand_placement(part):
                         row["message"] = "Multiple StockItems intentionally proposed for Hand Placement / use-up-stock behavior."
                         result["easy"].append(row)
                     else:
@@ -738,7 +777,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
 
     def _allocation_rows(self, preview):
         rows = {}
-        for section in ("easy", "spillage", "location", "multi"):
+        for section in ("easy", "variant", "spillage", "location", "multi"):
             for row in preview.get(section, []):
                 key = row.get("commit_key")
                 if key:
@@ -800,7 +839,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                     }, status=409)
                 section = str(entry.get("section") or "")
                 row = entry.get("row")
-                if section not in ("easy", "spillage", "location", "multi") or not isinstance(row, dict):
+                if section not in ("easy", "variant", "spillage", "location", "multi") or not isinstance(row, dict):
                     return JsonResponse({
                         "error": "Selected Preview details are invalid. Run Analyze / Preview again.",
                         "stale": [key],
@@ -920,9 +959,14 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                         if self._outside_group_allocated_quantity(stock, group_ids) > 0:
                             raise ValueError(f"Stock #{sid} is allocated to another Build Order outside this group. Release it or establish valid sequential reuse.")
                         if getattr(stock, "part_id", None) != int(row["part_id"]):
-                            raise ValueError(
-                                f"Stock #{sid} no longer matches {row.get('part')}."
+                            variant_ok = (
+                                section == "variant"
+                                and getattr(getattr(stock, "part", None), "variant_of_id", None) == int(row["part_id"])
                             )
+                            if not variant_ok:
+                                raise ValueError(
+                                    f"Stock #{sid} no longer matches {row.get('part')} or an approved direct variant."
+                                )
                         if qty <= 0 or remaining.get(sid, 0) + 1e-9 < qty:
                             raise ValueError(
                                 f"Stock #{sid} no longer has sufficient available quantity. "
@@ -1008,7 +1052,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v0220.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v0223.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
