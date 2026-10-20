@@ -212,7 +212,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                 _num(getattr(item, "quantity", 0), 0)
                 for item in BuildItem.objects.filter(build_line=line)
             )
-            outstanding = max(required - allocated, 0)
+            outstanding = max(_num(line.unallocated_quantity(), 0), 0)
 
             if part is not None and outstanding > 0:
                 rows.append((line, part, outstanding))
@@ -914,7 +914,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                         _num(getattr(item, "quantity", 0), 0)
                         for item in BuildItem.objects.filter(build_line=line)
                     )
-                    outstanding = max(required - allocated, 0)
+                    outstanding = max(_num(line.unallocated_quantity(), 0), 0)
 
                     requested = _num(row.get("allocate_qty"), 0)
                     if requested <= 0 or outstanding + 1e-9 < requested:
