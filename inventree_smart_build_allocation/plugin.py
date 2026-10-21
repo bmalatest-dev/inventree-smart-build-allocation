@@ -6,7 +6,9 @@ from django.urls import path
 from plugin import InvenTreePlugin
 from plugin.mixins import  SettingsMixin, UserInterfaceMixin, UrlsMixin
 from . import PLUGIN_VERSION
-from .rules import rank_stock_items, planned_spillage, is_hand_placement, location_name, available_quantity, is_unreceived, is_consumed, has_blocked_stock_status, stock_status_text
+from .rules import (rank_stock_items, planned_spillage, is_hand_placement, location_name,
+                    available_quantity, is_unreceived, is_consumed, has_blocked_stock_status,
+                    stock_status_text, packaging)
 
 GROUP_TTL = 60 * 60 * 24 * 7
 
@@ -342,6 +344,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "physical_quantity": _num(getattr(stock, "quantity", 0)),
             "outside_allocated": outside,
             "location": loc or "Unknown",
+            "packaging": packaging(stock) or "—",
             "recommended": recommended,
             "selectable": selectable,
             "warnings": warnings,
@@ -351,7 +354,8 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
         recommended_ids = set(recommended_ids or [])
         return sorted(
             [self._stock_option(s, group_ids, s.pk in recommended_ids)
-             for s in stock_items if available_quantity(s) > 0],
+             for s in stock_items
+             if available_quantity(s) > 0 and self._projected_start_quantity(s, group_ids) > 0],
             key=lambda x: (not x["recommended"], not x["selectable"], len(x["warnings"]),
                            x["quantity"], x["stock_id"]),
         )
@@ -365,6 +369,11 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             if is_consumed(stock):
                 continue
             outside = self._outside_group_allocated_quantity(stock, group_ids)
+            projected_qty = self._projected_start_quantity(stock, group_ids)
+            # A package with no projected quantity cannot help this decision and
+            # should not displace genuinely usable StockItems in the UI.
+            if projected_qty <= 0:
+                continue
             if outside > 0:
                 from build.models import BuildItem
                 owners = sorted({str(item.build_line.build.reference) for item in BuildItem.objects.filter(stock_item=stock).select_related("build_line__build") if item.build_line and item.build_line.build_id not in group_ids})
@@ -383,11 +392,12 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             options.append({
                 "stock_id": stock.pk,
                 "batch_id": _batch_id(stock),
-                "quantity": self._projected_start_quantity(stock, group_ids),
+                "quantity": projected_qty,
                 "physical_quantity": _num(getattr(stock, "quantity", 0)),
                 "outside_allocated": outside,
                 "unallocated_quantity": max(_num(getattr(stock, "quantity", 0)) - outside, 0),
                 "location": loc or "Unknown",
+                "packaging": packaging(stock) or "—",
                 "reason": reason,
             })
         return options
@@ -749,17 +759,34 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                         result["multi"].append(row)
                 else:
                     manual_options = self._manual_stock_options(stock_items, group_ids)
-                    if manual_options:
+                    all_options = self._stock_options(stock_items, group_ids)
+                    if manual_options or all_options:
+                        # Show every physically useful candidate for the part. Earlier
+                        # versions displayed only exception stock here, which could hide
+                        # valid StockItems while still showing a zero-usable package.
+                        decision_options = []
+                        manual_by_id = {x["stock_id"]: x for x in manual_options}
+                        for option in all_options:
+                            item = dict(option)
+                            manual = manual_by_id.get(item["stock_id"])
+                            if manual:
+                                item["reason"] = manual.get("reason")
+                            elif item.get("warnings"):
+                                item["reason"] = "; ".join(item["warnings"])
+                            else:
+                                item["reason"] = "Available for manual allocation."
+                            item["unallocated_quantity"] = max(item.get("physical_quantity", 0) - item.get("outside_allocated", 0), 0)
+                            decision_options.append(item)
                         result["manual"].append({
                             "build": _build_label(build), "build_id": build.pk, "build_url": _build_url(build),
                             "build_part": _build_part(build),
                             "part": str(part), "part_id": part.pk, "part_url": _part_url(part),
                             "override_key": override_key, "line_id": line_id,
-                            "required": outstanding,
+                            "required": outstanding, "allocate_qty": outstanding,
                             "available_automatic": outstanding - remaining,
-                            "options": manual_options,
-                            "stock_options": self._stock_options(stock_items, group_ids),
-                            "message": "Automatic allocation cannot satisfy the requirement, but stock exists which requires a user decision.",
+                            "options": decision_options,
+                            "stock_options": all_options,
+                            "message": "Automatic allocation cannot satisfy the requirement. Select StockItems and quantities here to resolve it.",
                         })
                     else:
                         result["insufficient"].append({
@@ -772,6 +799,15 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
                             "stock_options": self._stock_options(stock_items, group_ids),
                             "message": "Actual BOM quantity cannot be satisfied. " + demand_detail,
                         })
+
+        # Standardize operator-facing fields across every section.
+        for section_name in ("easy", "variant", "spillage", "location", "multi", "manual", "insufficient"):
+            for row in result.get(section_name, []):
+                row.setdefault("required", row.get("bom_qty", row.get("allocate_qty", 0)))
+                if not row.get("packaging"):
+                    chosen_id = row.get("stock_id")
+                    chosen = next((x for x in row.get("stock_options", []) if x.get("stock_id") == chosen_id), None)
+                    row["packaging"] = (chosen or {}).get("packaging") or "—"
 
         return result
 
@@ -1052,7 +1088,7 @@ class SmartBuildAllocationPlugin(UrlsMixin, SettingsMixin, UserInterfaceMixin, I
             "title": "Smart Allocation",
             "description": "Shared Allocation Group, sequence and allocation preview",
             "icon": "ti:arrows-sort",
-            "source": self.plugin_static_file("smart_allocation_v0227.js:renderPanel"),
+            "source": self.plugin_static_file("smart_allocation_v0228.js:renderPanel"),
             "context": {
                 "version": self.VERSION,
                 "build_id": int(target_id),
