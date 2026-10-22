@@ -105,12 +105,24 @@ function EasyLocationSelector(props) {
   );
 }
 
+function removeLegacyVersionLabel(node) {
+  if (typeof node === "string") {
+    return node.replace(/^V0\.2\.28\s+[—-]\s+Shared Allocation Group$/, "Shared Allocation Group");
+  }
+  if (Array.isArray(node)) return node.map(removeLegacyVersionLabel);
+  if (!React?.isValidElement?.(node)) return node;
+  const children = node.props?.children;
+  if (children == null) return node;
+  const nextChildren = React.Children.map(children, removeLegacyVersionLabel);
+  return React.cloneElement(node, undefined, nextChildren);
+}
+
 export function renderPanel(props) {
   if (!React?.createElement) return null;
   return React.createElement(
     React.Fragment,
     null,
     React.createElement(EasyLocationSelector, props),
-    renderBasePanel(props)
+    removeLegacyVersionLabel(renderBasePanel(props))
   );
 }
