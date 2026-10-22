@@ -1,4 +1,4 @@
-import { renderPanel as renderBasePanel } from "./smart_allocation_v029.js";
+import { renderPanel as renderBasePanel } from "./smart_allocation_v0228.js";
 
 const React = globalThis.React;
 
@@ -8,6 +8,8 @@ function EasyLocationSelector(props) {
   const url = cfg.easy_location_url;
   const [data, setData] = React.useState(null);
   const [selected, setSelected] = React.useState("");
+  const [query, setQuery] = React.useState("");
+  const [open, setOpen] = React.useState(false);
   const [msg, setMsg] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const csrf = () => document.cookie.match(/csrftoken=([^;]+)/)?.[1] || "";
@@ -20,6 +22,7 @@ function EasyLocationSelector(props) {
       .then((d) => {
         setData(d);
         setSelected(d.location_id == null ? "" : String(d.location_id));
+        setQuery(d.location?.label || "");
         setMsg("");
       })
       .catch((err) => setMsg(String(err)))
@@ -28,9 +31,16 @@ function EasyLocationSelector(props) {
 
   React.useEffect(() => { load(); }, [load]);
 
+  const choose = (x) => {
+    setSelected(String(x.pk));
+    setQuery(x.label || x.name || `Location ${x.pk}`);
+    setOpen(false);
+    setMsg("");
+  };
+
   const save = () => {
     if (!url || !selected) {
-      setMsg("Select the Default Easy Location for this run.");
+      setMsg("Search for and select the Default Easy Location for this run.");
       return;
     }
     setBusy(true);
@@ -44,6 +54,7 @@ function EasyLocationSelector(props) {
       .then((d) => {
         setData(d);
         setSelected(d.location_id == null ? "" : String(d.location_id));
+        setQuery(d.location?.label || "");
         setMsg(`Default Easy Location saved: ${d.location?.label || "selected location"}.`);
       })
       .catch((err) => setMsg(String(err)))
@@ -51,30 +62,42 @@ function EasyLocationSelector(props) {
   };
 
   if (!url) return null;
+  const q = query.trim().toLowerCase();
+  const matches = (data?.locations || [])
+    .filter((x) => !q || String(x.label || x.name || "").toLowerCase().includes(q))
+    .slice(0, 30);
+
   return e(
     "div",
     { style: { padding: "12px 12px 0 12px" } },
     e(
       "div",
-      { style: { padding: "10px", border: "1px solid #bbb", borderRadius: "5px", marginBottom: "0" } },
+      { style: { padding: "10px", border: "1px solid #bbb", borderRadius: "5px" } },
       e("strong", null, "Default Easy Stock Location"),
       e("p", { style: { margin: "6px 0" } },
-        "Choose the normal stock location for this Shared Allocation Group. Stock in this location or its child locations is Easy. Stock already allocated to a selected BO is also Easy regardless of location."
+        "Stock in this location or its child locations is Easy. Stock already allocated to a selected BO is also Easy regardless of location."
       ),
-      e(
-        "div",
-        { style: { display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" } },
-        e(
-          "select",
-          {
-            value: selected,
-            onChange: (ev) => setSelected(ev.target.value),
-            disabled: busy,
-            style: { minWidth: "320px", maxWidth: "620px", padding: "6px" },
-          },
-          e("option", { value: "" }, "Select stock location…"),
-          ...((data?.locations || []).map((x) => e("option", { key: x.pk, value: String(x.pk) }, x.label)))
-        ),
+      e("div", { style: { position: "relative", maxWidth: "620px" } },
+        e("input", {
+          type: "text",
+          value: query,
+          placeholder: "Search stock locations…",
+          disabled: busy,
+          onFocus: () => setOpen(true),
+          onChange: (ev) => { setQuery(ev.target.value); setSelected(""); setOpen(true); },
+          style: { width: "100%", padding: "7px", boxSizing: "border-box" },
+        }),
+        open && matches.length
+          ? e("div", { style: { position: "absolute", zIndex: 20, left: 0, right: 0, maxHeight: "240px", overflowY: "auto", border: "1px solid #aaa", background: "var(--mantine-color-body, white)", boxShadow: "0 3px 10px rgba(0,0,0,.15)" } },
+              ...matches.map((x) => e("button", {
+                key: x.pk,
+                type: "button",
+                onClick: () => choose(x),
+                style: { display: "block", width: "100%", textAlign: "left", padding: "8px 10px", border: 0, borderBottom: "1px solid #ddd", background: "transparent", cursor: "pointer" },
+              }, x.label || x.name || `Location ${x.pk}`)))
+          : null
+      ),
+      e("div", { style: { marginTop: "8px" } },
         e("button", { onClick: save, disabled: busy || !selected }, busy ? "Saving…" : "Save Default Location")
       ),
       msg ? e("div", { style: { marginTop: "6px" } }, msg) : null
