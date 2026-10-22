@@ -15,7 +15,7 @@ def _easy_location_key(build_id):
 
 
 class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
-    """v0.2.32: per-run Default Easy Location plus exact selected-group allocation reuse."""
+    """v0.2.32: selectable Default Easy Location plus selected-group allocation reuse."""
 
     def setup_urls(self):
         return super().setup_urls() + [
@@ -24,7 +24,6 @@ class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
 
     def _default_component_room_id(self):
         from stock.models import StockLocation
-
         location = StockLocation.objects.filter(name__iexact="Component Room").order_by("pk").first()
         if location is None:
             location = StockLocation.objects.filter(name__icontains="Component Room").order_by("pk").first()
@@ -52,7 +51,7 @@ class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
         return str(location)
 
     def _location_is_within(self, location, selected_location_id):
-        """True for the selected location itself or any of its descendants."""
+        """True for the selected location itself or any descendant location."""
         if location is None or selected_location_id is None:
             return False
         seen = set()
@@ -67,9 +66,8 @@ class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
         return False
 
     def _currently_allocated_to_group(self, stock, group_ids):
-        """Use live BuildItem allocations, not location names or historical relation guesses."""
+        """Use live BuildItem allocations as the authority for sequential reuse."""
         from build.models import BuildItem
-
         return BuildItem.objects.filter(
             stock_item=stock,
             build_line__build_id__in=[int(x) for x in (group_ids or [])],
@@ -93,10 +91,10 @@ class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
                 cache.set(_easy_location_key(bid), location.pk, EASY_LOCATION_TTL)
 
         selected_id = self._easy_location_id(build_id)
-        locations = []
-        for location in StockLocation.objects.select_related("parent").all().order_by("name", "pk"):
-            locations.append({"pk": location.pk, "label": self._location_label(location)})
-
+        locations = [
+            {"pk": location.pk, "label": self._location_label(location)}
+            for location in StockLocation.objects.select_related("parent").all().order_by("name", "pk")
+        ]
         selected = next((x for x in locations if x["pk"] == selected_id), None)
         return JsonResponse({
             "build_id": int(build_id),
@@ -107,7 +105,7 @@ class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
         })
 
     def group_view(self, request, build_id):
-        """Keep the selected Easy Location attached when the group membership changes."""
+        """Carry the run's selected Easy Location when group membership changes."""
         selected_id = self._easy_location_id(build_id)
         response = super().group_view(request, build_id)
         if request.method == "POST" and getattr(response, "status_code", 500) < 400 and selected_id is not None:
@@ -120,47 +118,78 @@ class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
         return response
 
     def _preview(self, build_id, overrides=None):
-        """Use selected location hierarchy or live selected-group allocation as the Easy rule."""
-        from stock.models import StockItem
+        """Easy means selected location hierarchy OR live allocation to a selected BO."""
+        from stock.models import StockItem, StockLocation
         from . import plugin as plugin_module
+        from .rules import (
+            LOW_COST_REEL_THRESHOLD, available_quantity, has_blocked_stock_status,
+            is_consumed, is_hand_placement, is_out_for_assembly, is_reel,
+            is_rework_room, is_storage_room, is_unreceived, packaging_rank,
+            purchase_price, relation_rank,
+        )
 
         group_ids = self._get_group(build_id)
         selected_location_id = self._easy_location_id(build_id)
         original_rank = plugin_module.rank_stock_items
 
         def run_rank(stock_items, required_part=None, required_qty=0, group_build_ids=None, projected_quantities=None):
-            ranked = original_rank(
-                stock_items,
-                required_part,
-                required_qty,
-                group_build_ids=group_build_ids,
-                projected_quantities=projected_quantities,
-            )
-            original_position = {getattr(stock, "pk", None): i for i, stock in enumerate(ranked)}
-            return sorted(
-                ranked,
-                key=lambda stock: (
-                    0 if self._currently_allocated_to_group(stock, group_ids) else 1,
-                    0 if self._location_is_within(getattr(stock, "location", None), selected_location_id) else 1,
-                    original_position.get(getattr(stock, "pk", None), 10**9),
-                ),
-            )
+            """v0.2 ranking with the hard-coded Component Room preference replaced."""
+            req = max(float(required_qty or 0), 0.0)
+            projected_quantities = projected_quantities or {}
+            hand = is_hand_placement(required_part)
+            candidates = []
+            for stock in list(stock_items):
+                group_use = self._currently_allocated_to_group(stock, group_ids)
+                easy_location = self._location_is_within(getattr(stock, "location", None), selected_location_id)
+                if is_consumed(stock) or is_unreceived(stock) or has_blocked_stock_status(stock):
+                    continue
+                # Out-for-Assembly naming is no longer authoritative. Such stock is
+                # automatic only when its actual allocation belongs to this group or
+                # the user explicitly selected its location as Default Easy.
+                if is_out_for_assembly(stock) and not group_use and not easy_location:
+                    continue
+                candidates.append(stock)
 
-        # The validated allocation engine remains unchanged; only location preference
-        # is supplied for this preview invocation.
+            def key(stock):
+                q = projected_quantities.get(getattr(stock, "pk", None), available_quantity(stock))
+                enough = q >= req if req > 0 else True
+                group_use = self._currently_allocated_to_group(stock, group_ids)
+                easy_location = self._location_is_within(getattr(stock, "location", None), selected_location_id)
+                price = purchase_price(stock)
+                cheap_reel = price is not None and price < LOW_COST_REEL_THRESHOLD and is_reel(stock)
+                if hand:
+                    loc_rank = 0 if easy_location else (1 if is_rework_room(stock) else (2 if is_storage_room(stock) else 3))
+                    package_choice = (0 if enough else 1, q if enough else -q)
+                else:
+                    loc_rank = 0 if easy_location else 1
+                    package_choice = (0 if enough else 1, q if enough else -q)
+                return (
+                    0 if group_use else 1,
+                    relation_rank(stock, required_part),
+                    loc_rank,
+                    0 if cheap_reel else 1,
+                    packaging_rank(stock) if not hand else 0,
+                    *package_choice,
+                    getattr(stock, "pk", 0) or 0,
+                )
+
+            return sorted(candidates, key=key)
+
+        # Keep the validated engine intact while supplying this run's location-aware
+        # ranking function for the duration of the preview.
         plugin_module.rank_stock_items = run_rank
         try:
             result = super()._preview(build_id, overrides=overrides)
         finally:
             plugin_module.rank_stock_items = original_rank
 
-        # Reclassify only rows whose distinction is location. Variant, spillage,
-        # multi-package and shortage decisions retain their existing behavior.
-        location_rows = list(result.get("location", []))
-        easy_rows = list(result.get("easy", []))
-        reconsider = easy_rows + location_rows
+        # Replace the old hard-coded location classification. Only Easy/Location
+        # rows are reconsidered; variant, spillage, multi and shortage behavior stays intact.
+        reconsider = list(result.get("easy", [])) + list(result.get("location", []))
         result["easy"] = []
         result["location"] = []
+        selected_location = StockLocation.objects.filter(pk=selected_location_id).first() if selected_location_id else None
+        selected_label = self._location_label(selected_location) if selected_location is not None else "selected Default Easy Location"
 
         for row in reconsider:
             stock = None
@@ -169,11 +198,9 @@ class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
                 try:
                     stock = StockItem.objects.select_related("location", "location__parent").get(pk=stock_id)
                 except StockItem.DoesNotExist:
-                    stock = None
+                    pass
 
-            in_default_location = stock is not None and self._location_is_within(
-                getattr(stock, "location", None), selected_location_id
-            )
+            in_default_location = stock is not None and self._location_is_within(getattr(stock, "location", None), selected_location_id)
             allocated_to_group = stock is not None and self._currently_allocated_to_group(stock, group_ids)
 
             if in_default_location or allocated_to_group:
@@ -183,12 +210,6 @@ class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
                     row.pop("message", None)
                 result["easy"].append(row)
             else:
-                selected_label = "selected Default Easy Location"
-                if selected_location_id is not None:
-                    from stock.models import StockLocation
-                    selected_location = StockLocation.objects.filter(pk=selected_location_id).first()
-                    if selected_location is not None:
-                        selected_label = self._location_label(selected_location)
                 row["message"] = (
                     f"Stock is outside the Default Easy Location ({selected_label}) and is not currently "
                     "allocated to a Build Order in this Shared Allocation Group."
@@ -197,7 +218,7 @@ class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
 
         result["default_easy_location"] = {
             "pk": selected_location_id,
-            "label": next((self._location_label(x) for x in __import__("stock.models", fromlist=["StockLocation"]).StockLocation.objects.filter(pk=selected_location_id)), "") if selected_location_id is not None else "",
+            "label": selected_label if selected_location is not None else "",
         }
         return result
 
