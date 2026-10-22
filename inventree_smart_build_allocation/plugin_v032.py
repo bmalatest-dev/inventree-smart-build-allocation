@@ -15,7 +15,7 @@ def _easy_location_key(build_id):
 
 
 class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
-    """v0.2.32: selectable Default Easy Location plus selected-group allocation reuse."""
+    """v0.2.34: selectable Default Easy Location plus selected-group allocation reuse."""
 
     def setup_urls(self):
         return super().setup_urls() + [
@@ -39,15 +39,27 @@ class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
         return self._default_component_room_id()
 
     def _location_label(self, location):
-        for attr in ("get_path_string", "get_path"):
-            fn = getattr(location, attr, None)
-            if callable(fn):
-                try:
-                    value = fn()
-                    if value:
-                        return str(value)
-                except Exception:
-                    pass
+        """Return a human-readable parent / child path for a StockLocation."""
+        if location is None:
+            return ""
+
+        # InvenTree 1.5.x get_path() can return structured dictionaries. Build
+        # the display path directly from the parent relationship instead of
+        # stringifying that internal representation into the UI.
+        names = []
+        seen = set()
+        current = location
+        while current is not None and getattr(current, "pk", None) not in seen:
+            current_id = getattr(current, "pk", None)
+            if current_id is not None:
+                seen.add(current_id)
+            name = getattr(current, "name", None)
+            if name:
+                names.append(str(name))
+            current = getattr(current, "parent", None)
+
+        if names:
+            return " / ".join(reversed(names))
         return str(location)
 
     def _location_is_within(self, location, selected_location_id):
@@ -143,9 +155,6 @@ class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
                 easy_location = self._location_is_within(getattr(stock, "location", None), selected_location_id)
                 if is_consumed(stock) or is_unreceived(stock) or has_blocked_stock_status(stock):
                     continue
-                # Out-for-Assembly naming is no longer authoritative. Such stock is
-                # automatic only when its actual allocation belongs to this group or
-                # the user explicitly selected its location as Default Easy.
                 if is_out_for_assembly(stock) and not group_use and not easy_location:
                     continue
                 candidates.append(stock)
@@ -175,16 +184,12 @@ class SmartBuildAllocationPlugin(SmartBuildAllocationPluginBase):
 
             return sorted(candidates, key=key)
 
-        # Keep the validated engine intact while supplying this run's location-aware
-        # ranking function for the duration of the preview.
         plugin_module.rank_stock_items = run_rank
         try:
             result = super()._preview(build_id, overrides=overrides)
         finally:
             plugin_module.rank_stock_items = original_rank
 
-        # Replace the old hard-coded location classification. Only Easy/Location
-        # rows are reconsidered; variant, spillage, multi and shortage behavior stays intact.
         reconsider = list(result.get("easy", [])) + list(result.get("location", []))
         result["easy"] = []
         result["location"] = []
