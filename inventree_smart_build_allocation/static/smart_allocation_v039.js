@@ -1,20 +1,8 @@
-import { renderPanel as renderBasePanel } from "./smart_allocation_v0228.js";
+import { renderPanel as renderV032Panel } from "./smart_allocation_v032.js";
 
-const React = globalThis.React;
-
-function replaceLegacyVersionLabel(node) {
-  if (typeof node === "string") {
-    return node.replace(/^V0\.2\.28\s+[—-]\s+Shared Allocation Group$/, "Shared Allocation Group");
-  }
-  if (Array.isArray(node)) return node.map(replaceLegacyVersionLabel);
-  if (!React?.isValidElement?.(node)) return node;
-  const children = node.props?.children;
-  if (children == null) return node;
-  const nextChildren = React.Children.map(children, replaceLegacyVersionLabel);
-  return React.cloneElement(node, undefined, nextChildren);
-}
-
+// v0.2.39 deliberately uses a new static filename to make deployment/cache
+// state visible. v0.2.32 already removes the legacy "V0.2.28 —" heading and
+// includes the Default Easy Stock Location selector.
 export function renderPanel(props) {
-  if (!React?.createElement) return null;
-  return replaceLegacyVersionLabel(renderBasePanel(props));
+  return renderV032Panel(props);
 }
