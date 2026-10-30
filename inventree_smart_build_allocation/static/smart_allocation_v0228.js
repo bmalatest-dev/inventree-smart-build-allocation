@@ -118,13 +118,7 @@ function SmartAllocationPanel(props) {
       })
       .then((d) => {
         setPreview(d);
-        const nextSelected = {};
-        ["easy", "variant", "spillage", "location", "multi"].forEach((section) => {
-          (d[section] || []).forEach((r) => {
-            if (r.commit_key) nextSelected[r.commit_key] = true;
-          });
-        });
-        setSelected(nextSelected);
+        setSelected({});
         setApproved({});
         setCommitResult(null);
       })
@@ -170,13 +164,7 @@ function SmartAllocationPanel(props) {
       .then(async (r) => { const d = await r.json(); if (!r.ok) throw new Error(d.error || "Preview failed"); return d; })
       .then((d) => {
         setPreview(d);
-        const nextSelected = {};
-        ["easy", "variant", "spillage", "location", "multi"].forEach((section) => {
-          (d[section] || []).forEach((r) => {
-            if (r.commit_key) nextSelected[r.commit_key] = true;
-          });
-        });
-        setSelected(nextSelected);
+        setSelected({});
         setApproved({});
         setCommitResult(null);
       })
@@ -345,11 +333,7 @@ function SmartAllocationPanel(props) {
       })
       .then((pd) => {
         setPreview(pd);
-        const nextSelected = {};
-        ["easy", "variant", "spillage", "location", "multi"].forEach((section) => {
-          (pd[section] || []).forEach((row) => { if (row.commit_key) nextSelected[row.commit_key] = true; });
-        });
-        setSelected(nextSelected);
+        setSelected({});
         setApproved({});
       })
       .catch((err) => setMsg(String(err)))
